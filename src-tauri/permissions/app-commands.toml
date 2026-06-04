@@ -1,0 +1,14 @@
+[[permission]]
+identifier = "allow-app-commands"
+description = "Enables ZD Switch custom commands."
+commands.allow = [
+  "get_auth_state",
+  "logout",
+  "open_login_window",
+  "refresh_user_profile",
+  "set_tool_switch",
+  "get_cli_tools_status",
+  "get_proxy_enabled",
+  "set_proxy_enabled",
+  "apply_config_injection",
+]
