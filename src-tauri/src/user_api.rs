@@ -358,5 +358,5 @@ fn device_name() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::consts::OS.to_string());
-    format!("zd-switch ({host})")
+    format!("zwitch ({host})")
 }

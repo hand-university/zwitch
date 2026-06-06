@@ -1,0 +1,101 @@
+name: Build Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            label: macos-arm64
+            args: --target aarch64-apple-darwin
+            target: aarch64-apple-darwin
+          - platform: macos-latest
+            label: macos-x64
+            args: --target x86_64-apple-darwin
+            target: x86_64-apple-darwin
+          - platform: ubuntu-22.04
+            label: linux-x64
+            args: --target x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-gnu
+          - platform: windows-latest
+            label: windows-x64
+            args: --target x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.platform }}
+    name: Build (${{ matrix.label }})
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 私钥仅通过 GitHub Secrets 注入，不得存放在仓库内。
+      # 在仓库 Settings → Secrets 配置 TAURI_SIGNING_PRIVATE_KEY（minisign 私钥全文）。
+      - name: Build Tauri app
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build -- ${{ matrix.args }}
+
+      - name: Build and publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ZWitch ${{ github.ref_name }}
+          releaseBody: Desktop builds for Linux x64, macOS arm64/x64, and Windows x64.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zwitch-${{ matrix.label }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/**/*
+          if-no-files-found: error

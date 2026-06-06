@@ -11,13 +11,16 @@ use axum::{
 use futures_util::StreamExt;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 /// 本地拦截服务实际监听的端口（启动时动态分配）。0 表示尚未启动。
 static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
+
+static PROXY_SHUTDOWN: OnceLock<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>> =
+    OnceLock::new();
 
 static CREDENTIALS: OnceLock<Arc<CredentialManager>> = OnceLock::new();
 
@@ -31,7 +34,73 @@ pub fn local_port() -> u16 {
 
 /// 写入 CLI 配置文件的本地拦截地址（按工具区分前缀），使用动态分配的端口。
 pub fn local_proxy_base(tool_id: &str) -> String {
-    format!("http://{LOCAL_PROXY_HOST}:{}/{tool_id}", local_port())
+    local_proxy_base_for_port(tool_id, local_port())
+}
+
+/// 按指定端口生成本地拦截 base_url。
+pub fn local_proxy_base_for_port(tool_id: &str, port: u16) -> String {
+    format!("http://{LOCAL_PROXY_HOST}:{port}/{tool_id}")
+}
+
+/// 从已注入的本地代理 URL 中解析端口。
+pub fn parse_local_proxy_port(url: &str) -> Option<u16> {
+    let prefix = format!("http://{LOCAL_PROXY_HOST}:");
+    let rest = url.strip_prefix(&prefix)?;
+    let (port_str, _) = rest.split_once('/')?;
+    port_str.parse().ok()
+}
+
+/// 判断端口是否可用于绑定：当前已由本服务占用视为可用，否则尝试绑定探测。
+pub fn is_port_available(port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
+    if port == local_port() {
+        return true;
+    }
+    StdTcpListener::bind((LOCAL_PROXY_HOST, port)).is_ok()
+}
+
+/// 绑定到端口 0，返回系统分配的空闲端口。
+pub fn find_available_port() -> Option<u16> {
+    let listener = StdTcpListener::bind((LOCAL_PROXY_HOST, 0)).ok()?;
+    listener.local_addr().ok().map(|addr| addr.port())
+}
+
+fn request_proxy_shutdown() {
+    if let Some(lock) = PROXY_SHUTDOWN.get() {
+        if let Some(tx) = lock.lock().ok().and_then(|mut guard| guard.take()) {
+            let _ = tx.send(());
+        }
+    }
+}
+
+fn store_proxy_shutdown(tx: tokio::sync::oneshot::Sender<()>) {
+    let lock = PROXY_SHUTDOWN.get_or_init(|| StdMutex::new(None));
+    if let Ok(mut guard) = lock.lock() {
+        *guard = Some(tx);
+    }
+}
+
+/// 确保本地拦截服务在 `preferred` 端口监听；若该端口被其他进程占用则改用空闲端口。
+pub fn ensure_listening(
+    app: tauri::AppHandle,
+    fingerprint: String,
+    preferred: Option<u16>,
+) -> Option<u16> {
+    let port = match preferred {
+        Some(p) if is_port_available(p) => p,
+        Some(_) => find_available_port()?,
+        None if local_port() != 0 => return Some(local_port()),
+        None => return start(app, fingerprint),
+    };
+
+    if local_port() == port {
+        return Some(port);
+    }
+
+    request_proxy_shutdown();
+    start_on_port(app, fingerprint, port)
 }
 
 /// 登出或授权失效时清空内存中的临时凭证缓存。
@@ -93,11 +162,7 @@ impl CredentialManager {
             .await
             .map_err(|e| e.message())?;
 
-        if let Some(new_base) = resp
-            .base_url
-            .as_deref()
-            .and_then(normalize_api_base_url)
-        {
+        if let Some(new_base) = resp.base_url.as_deref().and_then(normalize_api_base_url) {
             let mut updated = auth;
             updated.api_base_url = Some(new_base);
             let _ = save_auth(&self.app, &updated);
@@ -175,6 +240,10 @@ struct ProxyState {
 /// 启动本地拦截服务。CLI 仅配置指向本服务的 base_url；本服务换取临时凭证后
 /// 注入 `Authorization: Bearer bf-tmp-...` 与 `X-Device-Fingerprint` 再转发上游。
 pub fn start(app: tauri::AppHandle, fingerprint: String) -> Option<u16> {
+    start_on_port(app, fingerprint, 0)
+}
+
+fn start_on_port(app: tauri::AppHandle, fingerprint: String, port: u16) -> Option<u16> {
     let credentials = Arc::new(CredentialManager::new(app.clone(), fingerprint.clone()));
     let _ = CREDENTIALS.set(credentials.clone());
 
@@ -185,14 +254,15 @@ pub fn start(app: tauri::AppHandle, fingerprint: String) -> Option<u16> {
         client: reqwest::Client::new(),
     });
 
-    let std_listener = match StdTcpListener::bind((LOCAL_PROXY_HOST, 0)) {
+    let bind_port = if port == 0 { 0 } else { port };
+    let std_listener = match StdTcpListener::bind((LOCAL_PROXY_HOST, bind_port)) {
         Ok(listener) => listener,
         Err(e) => {
-            eprintln!("本地拦截服务绑定空闲端口失败: {e}");
+            eprintln!("本地拦截服务绑定端口 {bind_port} 失败: {e}");
             return None;
         }
     };
-    let port = match std_listener.local_addr() {
+    let bound_port = match std_listener.local_addr() {
         Ok(addr) => addr.port(),
         Err(e) => {
             eprintln!("读取本地拦截服务端口失败: {e}");
@@ -203,7 +273,10 @@ pub fn start(app: tauri::AppHandle, fingerprint: String) -> Option<u16> {
         eprintln!("设置本地拦截服务非阻塞失败: {e}");
         return None;
     }
-    PROXY_PORT.store(port, Ordering::Relaxed);
+    PROXY_PORT.store(bound_port, Ordering::Relaxed);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    store_proxy_shutdown(shutdown_tx);
 
     tauri::async_runtime::spawn(async move {
         let listener = match TcpListener::from_std(std_listener) {
@@ -215,12 +288,18 @@ pub fn start(app: tauri::AppHandle, fingerprint: String) -> Option<u16> {
         };
 
         let app = Router::new().fallback(proxy_handler).with_state(state);
-        if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("本地拦截服务异常退出: {e}");
+        let serve = axum::serve(listener, app);
+        tokio::select! {
+            result = serve => {
+                if let Err(e) = result {
+                    eprintln!("本地拦截服务异常退出: {e}");
+                }
+            }
+            _ = shutdown_rx => {}
         }
     });
 
-    Some(port)
+    Some(bound_port)
 }
 
 async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
@@ -323,9 +402,7 @@ fn is_streaming_content_type(content_type: Option<&str>) -> bool {
         || lower.contains("application/stream+json")
 }
 
-async fn build_upstream_response(
-    upstream_resp: reqwest::Response,
-) -> Result<Response, String> {
+async fn build_upstream_response(upstream_resp: reqwest::Response) -> Result<Response, String> {
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -384,6 +461,23 @@ mod tests {
         assert_eq!(
             build_upstream_url("claude", "http://localhost:8080", "v1/messages"),
             "http://localhost:8080/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn parse_local_proxy_port_extracts_port() {
+        assert_eq!(
+            parse_local_proxy_port("http://127.0.0.1:51805/codex"),
+            Some(51805)
+        );
+        assert_eq!(parse_local_proxy_port("http://example.com/codex"), None);
+    }
+
+    #[test]
+    fn local_proxy_base_for_port_formats_url() {
+        assert_eq!(
+            local_proxy_base_for_port("claude", 58432),
+            "http://127.0.0.1:58432/claude"
         );
     }
 

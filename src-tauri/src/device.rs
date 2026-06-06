@@ -12,10 +12,10 @@ const FINGERPRINT_FIELD: &str = "fingerprint";
 pub fn get_or_create_fingerprint(app: &AppHandle) -> Result<String, String> {
     let store = get_store(app)?;
 
-    if let Some(existing) = store
-        .get(DEVICE_KEY)
-        .and_then(|v| v.get(FINGERPRINT_FIELD).and_then(|f| f.as_str().map(str::to_string)))
-    {
+    if let Some(existing) = store.get(DEVICE_KEY).and_then(|v| {
+        v.get(FINGERPRINT_FIELD)
+            .and_then(|f| f.as_str().map(str::to_string))
+    }) {
         if !existing.is_empty() {
             return Ok(existing);
         }

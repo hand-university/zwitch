@@ -1,14 +1,23 @@
 [[permission]]
 identifier = "allow-app-commands"
-description = "Enables ZD Switch custom commands."
+description = "Enables ZWitch custom commands."
 commands.allow = [
   "get_auth_state",
   "logout",
   "open_login_window",
   "refresh_user_profile",
-  "set_tool_switch",
   "get_cli_tools_status",
   "get_proxy_enabled",
   "set_proxy_enabled",
   "apply_config_injection",
+  "get_explore_items",
+  "install_marketplace_item",
+  "get_marketplace_items",
+  "sync_marketplace",
+  "set_marketplace_item_enabled",
+  "delete_marketplace_item",
+  "scan_local_marketplace",
+  "get_app_info",
+  "check_for_update",
+  "install_available_update",
 ]

@@ -1,30 +1,70 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { ExplorePage } from "@/pages/ExplorePage";
+import { Cloud, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
-  applyConfigInjection,
+  deleteMarketplaceItem,
   getAuthState,
   getCliToolsStatus,
+  getExploreItems,
+  getMarketplaceItems,
+  installMarketplaceItem,
   getProxyEnabled,
   logout,
   onAuthChanged,
   onLoginFailed,
   openLoginWindow,
   refreshUserProfile,
+  scanLocalMarketplace,
+  setMarketplaceItemEnabled,
   setProxyEnabled,
-  setToolSwitch,
+  syncMarketplace,
 } from "@/lib/api";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { Header } from "@/components/layout/Header";
+import { message, MessageHost } from "@/components/ui/message";
 import { LoginPage } from "@/pages/LoginPage";
+import { MarketplacePage } from "@/pages/MarketplacePage";
+import { AboutPage } from "@/pages/AboutPage";
 import { QuickStartPage } from "@/pages/QuickStartPage";
 import { isDev } from "@/config/env";
-import type { AppPage, AuthState, CliToolStatus, NavItem } from "@/types";
+import type {
+  AppPage,
+  AuthState,
+  CliToolStatus,
+  ExploreItem,
+  MarketplaceItem,
+  NavItem,
+} from "@/types";
 
-const NAV_ITEMS: NavItem[] = [{ id: "quick-start", label: "快速开始" }];
+const NAV_ITEMS: NavItem[] = [
+  { id: "quick-start", label: "快速开始" },
+  { id: "explore", label: "探索" },
+  { id: "skills", label: "技能" },
+  { id: "plugins", label: "插件" },
+  { id: "about", label: "关于" },
+];
 
 const PAGE_META: Record<AppPage, { title: string; description: string }> = {
   "quick-start": {
     title: "快速开始",
-    description: "管理 AI CLI 工具的代理配置",
+    description: "一键开启代理，自动配置已安装的工具",
+  },
+  explore: {
+    title: "探索",
+    description: "浏览云端分配给你的技能与插件",
+  },
+  skills: {
+    title: "技能",
+    description: "管理已安装的技能",
+  },
+  plugins: {
+    title: "插件",
+    description: "管理已安装的插件",
+  },
+  about: {
+    title: "关于",
+    description: "应用信息与版本更新",
   },
 };
 
@@ -40,19 +80,27 @@ const defaultAuth: AuthState = {
 export default function App() {
   const [auth, setAuth] = useState<AuthState>(defaultAuth);
   const [tools, setTools] = useState<CliToolStatus[]>([]);
+  const [marketplaceItems, setMarketplaceItems] = useState<MarketplaceItem[]>([]);
+  const [exploreItems, setExploreItems] = useState<ExploreItem[]>([]);
   const [proxyEnabled, setProxyEnabledState] = useState(false);
   const [activePage, setActivePage] = useState<AppPage>("quick-start");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
   const refreshTools = useCallback(async () => {
-    const [cliTools, enabled] = await Promise.all([
+    const [cliTools, enabled, items] = await Promise.all([
       getCliToolsStatus(),
       getProxyEnabled(),
+      getMarketplaceItems(),
     ]);
     setTools(cliTools);
     setProxyEnabledState(enabled);
+    setMarketplaceItems(items);
+  }, []);
+
+  const loadExploreItems = useCallback(async () => {
+    const items = await getExploreItems();
+    setExploreItems(items);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -62,13 +110,16 @@ export default function App() {
       setAuth(authState);
       if (authState.is_logged_in) {
         await refreshTools();
+        if (activePage === "explore") {
+          await loadExploreItems();
+        }
       }
     } catch (e) {
-      setError(String(e));
+      message.error(String(e));
     } finally {
       setBusy(false);
     }
-  }, [refreshTools]);
+  }, [refreshTools, loadExploreItems, activePage]);
 
   const refreshProfile = useCallback(async () => {
     setBusy(true);
@@ -76,13 +127,11 @@ export default function App() {
       const authState = await refreshUserProfile();
       setAuth(authState);
       if (authState.is_logged_in) {
-        // 续期成功，清除可能存在的旧错误
-        setError(null);
         await refreshTools();
       }
       // 若已登出（设备授权失效），保留后端通过 login-failed 推送的提示
     } catch (e) {
-      setError(String(e));
+      message.error(String(e));
     } finally {
       setBusy(false);
     }
@@ -97,7 +146,7 @@ export default function App() {
           await refreshProfile();
         }
       } catch (e) {
-        setError(String(e));
+        message.error(String(e));
       } finally {
         setLoading(false);
       }
@@ -107,12 +156,11 @@ export default function App() {
   useEffect(() => {
     const unlistenAuth = onAuthChanged((state) => {
       setAuth(state);
-      setError(null);
-      refreshTools().catch((e) => setError(String(e)));
+      refreshTools().catch((e) => message.error(String(e)));
     });
 
-    const unlistenFail = onLoginFailed((message) => {
-      setError(message);
+    const unlistenFail = onLoginFailed((text) => {
+      message.error(text);
     });
 
     return () => {
@@ -121,12 +169,21 @@ export default function App() {
     };
   }, [refreshTools]);
 
+  useEffect(() => {
+    if (!auth.is_logged_in || activePage !== "explore") {
+      return;
+    }
+    setBusy(true);
+    loadExploreItems()
+      .catch((e) => message.error(String(e)))
+      .finally(() => setBusy(false));
+  }, [auth.is_logged_in, activePage, loadExploreItems]);
+
   const handleLogin = async () => {
-    setError(null);
     try {
       await openLoginWindow();
     } catch (e) {
-      setError(String(e));
+      message.error(String(e));
     }
   };
 
@@ -136,22 +193,8 @@ export default function App() {
       await logout();
       setAuth(defaultAuth);
       setTools([]);
-      setError(null);
     } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleToolSwitch = async (toolId: string, enabled: boolean) => {
-    setBusy(true);
-    try {
-      await setToolSwitch(toolId, enabled);
-      await applyConfigInjection();
-      await refreshTools();
-    } catch (e) {
-      setError(String(e));
+      message.error(String(e));
     } finally {
       setBusy(false);
     }
@@ -163,52 +206,182 @@ export default function App() {
       await setProxyEnabled(enabled);
       await refreshTools();
     } catch (e) {
-      setError(String(e));
+      message.error(String(e));
     } finally {
       setBusy(false);
     }
   };
 
-  if (loading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center text-muted-foreground">
-        加载中...
-      </div>
-    );
-  }
+  const handleMarketplaceSync = async () => {
+    setBusy(true);
+    try {
+      await syncMarketplace();
+      await Promise.all([refreshTools(), loadExploreItems()]);
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
-  if (!auth.is_logged_in) {
-    return <LoginPage error={error} onLogin={handleLogin} />;
-  }
+  const refreshMarketplace = useCallback(async () => {
+    setBusy(true);
+    try {
+      await scanLocalMarketplace();
+      await refreshTools();
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [refreshTools]);
+
+  const handleMarketplaceToggle = async (
+    item: MarketplaceItem,
+    enabled: boolean,
+  ) => {
+    setBusy(true);
+    try {
+      await setMarketplaceItemEnabled(
+        item.platform,
+        item.item_type,
+        item.name,
+        enabled,
+      );
+      await refreshTools();
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleExploreInstall = async (item: ExploreItem) => {
+    setBusy(true);
+    try {
+      await installMarketplaceItem(item.platform, item.item_type, item.name);
+      await Promise.all([refreshTools(), loadExploreItems()]);
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleMarketplaceDelete = async (item: MarketplaceItem) => {
+    setBusy(true);
+    try {
+      await deleteMarketplaceItem(item.platform, item.item_type, item.name);
+      setMarketplaceItems((prev) =>
+        prev.filter(
+          (entry) =>
+            !(
+              entry.platform === item.platform &&
+              entry.item_type === item.item_type &&
+              entry.name === item.name
+            ),
+        ),
+      );
+      await Promise.all([refreshTools(), loadExploreItems()]);
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const pageMeta = PAGE_META[activePage];
 
-  return (
-    <AppLayout
-      auth={auth}
-      activePage={activePage}
-      navItems={NAV_ITEMS}
-      onNavigate={setActivePage}
-      onLogout={isDev ? handleLogout : undefined}
-    >
-      <Header title={pageMeta.title} description={pageMeta.description} />
-      {error ? (
-        <div className="mx-6 mt-4 shrink-0 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-          {error}
-        </div>
-      ) : null}
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {activePage === "quick-start" ? (
-          <QuickStartPage
-            tools={tools}
-            busy={busy}
-            proxyEnabled={proxyEnabled}
-            onRefresh={refresh}
-            onToolSwitch={handleToolSwitch}
-            onProxyToggle={handleProxyToggle}
-          />
-        ) : null}
+  const refreshExploreItems = useCallback(async () => {
+    setBusy(true);
+    try {
+      await loadExploreItems();
+    } catch (e) {
+      message.error(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [loadExploreItems]);
+
+  const headerActions =
+    activePage === "quick-start" ? (
+      <Button variant="outline" size="sm" onClick={refresh} disabled={busy}>
+        <RefreshCw className={busy ? "animate-spin" : ""} />
+        刷新
+      </Button>
+    ) : activePage === "skills" || activePage === "plugins" ? (
+      <>
+        <Button variant="outline" size="sm" onClick={refreshMarketplace} disabled={busy}>
+          <RefreshCw className={busy ? "animate-spin" : ""} />
+          刷新
+        </Button>
+        <Button size="sm" onClick={handleMarketplaceSync} disabled={busy}>
+          <Cloud />
+          一键同步市场
+        </Button>
+      </>
+    ) : null;
+
+  let content: ReactNode;
+
+  if (loading) {
+    content = (
+      <div className="app-canvas flex min-h-screen items-center justify-center text-muted-foreground">
+        加载中...
       </div>
-    </AppLayout>
+    );
+  } else if (!auth.is_logged_in) {
+    content = <LoginPage onLogin={handleLogin} />;
+  } else {
+    content = (
+      <AppLayout
+        auth={auth}
+        activePage={activePage}
+        navItems={NAV_ITEMS}
+        onNavigate={setActivePage}
+        onLogout={isDev ? handleLogout : undefined}
+      >
+        <Header
+          title={pageMeta.title}
+          description={pageMeta.description}
+          actions={headerActions}
+        />
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {activePage === "quick-start" ? (
+            <QuickStartPage
+              tools={tools}
+              busy={busy}
+              proxyEnabled={proxyEnabled}
+              onProxyToggle={handleProxyToggle}
+            />
+          ) : null}
+          {activePage === "explore" ? (
+            <ExplorePage
+              items={exploreItems}
+              busy={busy}
+              onInstall={handleExploreInstall}
+              onSearch={refreshExploreItems}
+            />
+          ) : null}
+          {activePage === "skills" || activePage === "plugins" ? (
+            <MarketplacePage
+              itemType={activePage === "skills" ? "skill" : "plugin"}
+              items={marketplaceItems}
+              busy={busy}
+              onToggle={handleMarketplaceToggle}
+              onDelete={handleMarketplaceDelete}
+            />
+          ) : null}
+          {activePage === "about" ? <AboutPage busy={busy} /> : null}
+        </div>
+      </AppLayout>
+    );
+  }
+
+  return (
+    <>
+      <MessageHost />
+      {content}
+    </>
   );
 }

@@ -1,11 +1,16 @@
+import { AppIcon } from "@/components/ui/app-icon";
 import { Button } from "@/components/ui/button";
 import { isDev } from "@/config/env";
 import { cn } from "@/lib/utils";
 import type { AuthState, NavItem } from "@/types";
-import { LogOut, Rocket, Zap } from "lucide-react";
+import { Compass, Info, LogOut, Plug, Rocket, Sparkles } from "lucide-react";
 
 const NAV_ICONS = {
   "quick-start": Rocket,
+  explore: Compass,
+  skills: Sparkles,
+  plugins: Plug,
+  about: Info,
 } as const;
 
 interface SidebarProps {
@@ -44,14 +49,12 @@ export function Sidebar({
   onLogout,
 }: SidebarProps) {
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-border bg-sidebar">
+    <aside className="glass-sidebar flex h-full w-64 shrink-0 flex-col border-r">
       <div className="flex items-center gap-3 px-5 py-5">
-        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-sm">
-          <Zap className="h-5 w-5" />
-        </div>
+        <AppIcon size="sm" className="shadow-sm" />
         <div className="min-w-0">
           <p className="truncate text-sm font-semibold tracking-tight">
-            ZD Switch
+            ZWitch
           </p>
           <p className="truncate text-xs text-muted-foreground">AI CLI 代理配置</p>
         </div>
@@ -70,8 +73,8 @@ export function Sidebar({
               className={cn(
                 "flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-all",
                 active
-                  ? "bg-card font-medium text-foreground shadow-sm ring-1 ring-border"
-                  : "text-muted-foreground hover:bg-card/60 hover:text-foreground",
+                  ? "glass-surface font-medium text-foreground ring-1 ring-border/60"
+                  : "text-muted-foreground hover:bg-card/45 hover:text-foreground",
               )}
             >
               <Icon className="h-4 w-4 shrink-0" />
@@ -82,7 +85,7 @@ export function Sidebar({
       </nav>
 
       <div className="p-3">
-        <div className="flex items-center gap-3 rounded-xl bg-card p-2.5 shadow-sm ring-1 ring-border">
+        <div className="glass-surface flex items-center gap-3 rounded-xl p-2.5 ring-1 ring-border/60">
           <UserAvatar auth={auth} />
           <div className="min-w-0 flex-1">
             <p className="truncate text-sm font-medium">

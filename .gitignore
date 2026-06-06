@@ -19,6 +19,8 @@ dist-ssr
 # Tauri
 src-tauri/target
 src-tauri/gen
+# Updater 私钥目录，禁止入库（私钥仅放 GitHub Secrets 或本机 ~/.config 等仓库外路径）
+src-tauri/.updater-keys/
 
 # OS
 .DS_Store

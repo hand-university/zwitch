@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AuthState, CliToolStatus } from "@/types";
+import type {
+  AppInfo,
+  AuthState,
+  CliToolStatus,
+  ExploreItem,
+  MarketplaceItem,
+  MarketplaceSyncResult,
+  UpdateCheckResult,
+} from "@/types";
 
 export async function getAuthState(): Promise<AuthState> {
   return invoke("get_auth_state");
@@ -16,13 +24,6 @@ export async function logout(): Promise<void> {
 
 export async function refreshUserProfile(): Promise<AuthState> {
   return invoke("refresh_user_profile");
-}
-
-export async function setToolSwitch(
-  toolId: string,
-  enabled: boolean,
-): Promise<void> {
-  return invoke("set_tool_switch", { toolId, enabled });
 }
 
 export async function getCliToolsStatus(): Promise<CliToolStatus[]> {
@@ -51,4 +52,62 @@ export function onLoginFailed(callback: (message: string) => void) {
   return listen<string>("login-failed", (event) => {
     callback(event.payload);
   });
+}
+
+export async function getExploreItems(): Promise<ExploreItem[]> {
+  return invoke("get_explore_items");
+}
+
+export async function installMarketplaceItem(
+  platform: string,
+  itemType: string,
+  name: string,
+): Promise<void> {
+  return invoke("install_marketplace_item", { platform, itemType, name });
+}
+
+export async function getMarketplaceItems(): Promise<MarketplaceItem[]> {
+  return invoke("get_marketplace_items");
+}
+
+export async function syncMarketplace(): Promise<MarketplaceSyncResult> {
+  return invoke("sync_marketplace");
+}
+
+export async function setMarketplaceItemEnabled(
+  platform: string,
+  itemType: string,
+  name: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke("set_marketplace_item_enabled", {
+    platform,
+    itemType,
+    name,
+    enabled,
+  });
+}
+
+export async function deleteMarketplaceItem(
+  platform: string,
+  itemType: string,
+  name: string,
+): Promise<void> {
+  return invoke("delete_marketplace_item", { platform, itemType, name });
+}
+
+export async function scanLocalMarketplace(): Promise<number> {
+  return invoke("scan_local_marketplace");
+}
+
+export async function getAppInfo(): Promise<AppInfo> {
+  return invoke("get_app_info");
+}
+
+export async function checkForUpdate(): Promise<UpdateCheckResult> {
+  return invoke("check_for_update");
+}
+
+export async function installAvailableUpdate(): Promise<void> {
+  return invoke("install_available_update");
 }

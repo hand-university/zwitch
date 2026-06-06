@@ -46,11 +46,6 @@ pub fn logout(app: &AppHandle) -> Result<(), String> {
     revoke_current_device(app);
     crate::proxy::clear_credential_cache();
 
-    let mut settings = crate::store::load_settings(app)?;
-    for value in settings.tool_switches.values_mut() {
-        *value = false;
-    }
-    crate::store::save_settings(app, &settings)?;
     let _ = crate::cli_tools::apply_config_injection(app);
     clear_auth(app)?;
     emit_auth_changed(app)?;
@@ -151,6 +146,28 @@ async fn sync_profile(app: &AppHandle) -> Result<(), ApiError> {
         .map_err(ApiError::Other)?;
 
     Ok(())
+}
+
+/// 获取可用于 API 请求的 session token，必要时静默续期。
+pub async fn resolve_session_token(app: &AppHandle) -> Result<String, String> {
+    let auth = load_auth(app)?;
+    if auth.authorization_code.is_none() {
+        return Err("请先登录".into());
+    }
+    let base = resolve_api_base_url(&auth);
+    if let Some(token) = auth.access_token.clone() {
+        return Ok(token);
+    }
+    refresh_access_token(app, &auth, &base)
+        .await
+        .map_err(|e| e.message())
+}
+
+/// 强制用授权码换取新的 access_token。
+pub async fn force_refresh_session_token(app: &AppHandle) -> Result<String, ApiError> {
+    let auth = load_auth(app).map_err(ApiError::Other)?;
+    let base = resolve_api_base_url(&auth);
+    refresh_access_token(app, &auth, &base).await
 }
 
 /// 用持久授权码 + 设备指纹换取新的 access_token 并落盘。

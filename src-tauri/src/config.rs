@@ -2,18 +2,18 @@ use serde::{Deserialize, Serialize};
 
 /// Dev 登录页
 pub const LOGIN_BASE_URL: &str = "http://localhost:8080";
-/// 线上登录页（发布前替换）
-pub const LOGIN_BASE_URL_PROD: &str = "https://YOUR_PROD_LOGIN_DOMAIN";
+/// 线上登录页
+pub const LOGIN_BASE_URL_PROD: &str = "https://ft-wxhand.com/zai";
 
 /// Dev API
 pub const API_BASE_URL: &str = "http://localhost:8080";
-/// 线上 API（发布前替换）
-pub const API_BASE_URL_PROD: &str = "https://YOUR_PROD_API_DOMAIN";
+/// 线上 API
+pub const API_BASE_URL_PROD: &str = "https://ft-wxhand.com/zai";
 
 /// Dev 上游代理地址（本地拦截服务最终转发的目标）
 pub const PROXY_BASE_URL: &str = "http://localhost:8080/v1";
-/// 线上上游代理地址（发布前替换）
-pub const PROXY_BASE_URL_PROD: &str = "https://YOUR_PROD_PROXY_DOMAIN/v1";
+/// 线上上游代理地址
+pub const PROXY_BASE_URL_PROD: &str = "https://ft-wxhand.com/zai/v1";
 
 /// 本地拦截服务监听地址。各 AI CLI 的 base_url 会被指向
 /// `http://{LOCAL_PROXY_HOST}:{动态端口}/{tool_id}`。
@@ -25,10 +25,10 @@ pub const LOCAL_PROXY_HOST: &str = "127.0.0.1";
 pub const DEVICE_FINGERPRINT_HEADER: &str = "X-Device-Fingerprint";
 
 /// 打开登录页时携带的来源标识
-pub const LOGIN_SOURCE: &str = "zd-switch";
+pub const LOGIN_SOURCE: &str = "zwitch";
 
-/// Deep link scheme，登录成功后回调形如 zd-switch://open?access_token=xxx
-pub const DEEPLINK_SCHEME: &str = "zd-switch";
+/// Deep link scheme，登录成功后回调形如 zwitch://open?access_token=xxx
+pub const DEEPLINK_SCHEME: &str = "zwitch";
 pub const DEEPLINK_HOST: &str = "open";
 
 /// 设备授权码接口契约（需后端支持）。
@@ -47,6 +47,10 @@ pub const DEEPLINK_HOST: &str = "open";
 pub const DEVICE_AUTHORIZE_PATH: &str = "/api/aone/devices/authorize";
 pub const DEVICE_TOKEN_PATH: &str = "/api/aone/devices/token";
 pub const DEVICE_REVOKE_PATH: &str = "/api/aone/devices/revoke";
+
+/// 应用更新检查路径（Tauri updater 占位符：target / arch / current_version）
+pub const UPDATE_API_PATH: &str =
+    "/api/aone/zwitch/updates/{{target}}/{{arch}}/{{current_version}}";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {

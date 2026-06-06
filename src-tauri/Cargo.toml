@@ -1,12 +1,12 @@
 [package]
-name = "zd-switch"
+name = "zwitch"
 version = "0.1.0"
-description = "ZD Switch - AI CLI proxy configuration tool"
+description = "ZWitch - AI CLI proxy configuration tool"
 authors = ["zhangqiang"]
 edition = "2021"
 
 [lib]
-name = "zd_switch_lib"
+name = "zwitch_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -30,3 +30,8 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["time", "net", "rt-multi-thread", "io-util"] }
 axum = "0.8"
 futures-util = "0.3"
+toml = "0.8"
+tauri-plugin-process = "2"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"

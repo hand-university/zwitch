@@ -1,17 +1,24 @@
 mod auth;
 mod cli_tools;
+mod codex_plugins;
 mod config;
 mod device;
 mod macos_scheme;
+mod marketplace;
 mod proxy;
 mod store;
+mod updater;
 mod user_api;
+
+use std::sync::Mutex;
 
 /// 后台定时刷新用户资料与临时凭证的间隔（秒）。
 const SESSION_REFRESH_INTERVAL_SECS: u64 = 600;
 
 use auth::AuthState;
 use cli_tools::CliToolStatus;
+use marketplace::{ExploreItemView, MarketplaceItemView, MarketplaceSyncResult};
+use updater::{AppInfo, PendingUpdate, UpdateCheckResult};
 
 #[tauri::command]
 fn get_auth_state(app: tauri::AppHandle) -> Result<AuthState, String> {
@@ -26,18 +33,6 @@ fn open_login_window(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn logout(app: tauri::AppHandle) -> Result<(), String> {
     auth::logout(&app)
-}
-
-#[tauri::command]
-fn set_tool_switch(
-    app: tauri::AppHandle,
-    tool_id: String,
-    enabled: bool,
-) -> Result<(), String> {
-    let mut settings = store::load_settings(&app)?;
-    settings.tool_switches.insert(tool_id, enabled);
-    store::save_settings(&app, &settings)?;
-    cli_tools::apply_config_injection(&app)
 }
 
 #[tauri::command]
@@ -68,6 +63,78 @@ fn apply_config_injection(app: tauri::AppHandle) -> Result<(), String> {
     cli_tools::apply_config_injection(&app)
 }
 
+#[tauri::command]
+async fn get_explore_items(app: tauri::AppHandle) -> Result<Vec<ExploreItemView>, String> {
+    marketplace::get_explore_items(&app).await
+}
+
+#[tauri::command]
+async fn install_marketplace_item(
+    app: tauri::AppHandle,
+    platform: String,
+    item_type: String,
+    name: String,
+) -> Result<(), String> {
+    marketplace::install_marketplace_item(&app, platform, item_type, name).await
+}
+
+#[tauri::command]
+fn get_marketplace_items(app: tauri::AppHandle) -> Result<Vec<MarketplaceItemView>, String> {
+    marketplace::get_marketplace_items(&app)
+}
+
+#[tauri::command]
+async fn sync_marketplace(app: tauri::AppHandle) -> Result<MarketplaceSyncResult, String> {
+    marketplace::sync_marketplace(&app).await
+}
+
+#[tauri::command]
+fn set_marketplace_item_enabled(
+    app: tauri::AppHandle,
+    platform: String,
+    item_type: String,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    marketplace::set_marketplace_item_enabled(&app, platform, item_type, name, enabled)
+}
+
+#[tauri::command]
+fn delete_marketplace_item(
+    app: tauri::AppHandle,
+    platform: String,
+    item_type: String,
+    name: String,
+) -> Result<(), String> {
+    marketplace::delete_marketplace_item(&app, platform, item_type, name)
+}
+
+#[tauri::command]
+fn scan_local_marketplace(app: tauri::AppHandle) -> Result<u32, String> {
+    marketplace::scan_local_marketplace(&app)
+}
+
+#[tauri::command]
+fn get_app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
+    updater::get_app_info(app)
+}
+
+#[tauri::command]
+async fn check_for_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<UpdateCheckResult, String> {
+    updater::check_for_update(app, pending).await
+}
+
+#[tauri::command]
+async fn install_available_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<(), String> {
+    updater::install_available_update(app, pending).await
+}
+
 #[cfg(desktop)]
 use tauri::{Manager, RunEvent, WindowEvent};
 
@@ -84,7 +151,10 @@ fn focus_main_window(app: &tauri::AppHandle) {
 pub fn run() {
     macos_scheme::reexec_from_dev_app_if_needed();
 
-    let mut builder = tauri::Builder::default();
+    let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(PendingUpdate(Mutex::new(None)));
 
     #[cfg(desktop)]
     {
@@ -103,11 +173,20 @@ pub fn run() {
             open_login_window,
             logout,
             refresh_user_profile,
-            set_tool_switch,
             get_cli_tools_status,
             get_proxy_enabled,
             set_proxy_enabled,
             apply_config_injection,
+            get_explore_items,
+            install_marketplace_item,
+            get_marketplace_items,
+            sync_marketplace,
+            set_marketplace_item_enabled,
+            delete_marketplace_item,
+            scan_local_marketplace,
+            get_app_info,
+            check_for_update,
+            install_available_update,
         ])
         .setup(|app| {
             macos_scheme::ensure_url_scheme_registered()?;
@@ -169,7 +248,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             #[cfg(target_os = "macos")]
-            if let RunEvent::Reopen { has_visible_windows, .. } = event {
+            if let RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
                 if !has_visible_windows {
                     focus_main_window(app_handle);
                 }

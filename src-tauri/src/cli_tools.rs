@@ -1,3 +1,5 @@
+use crate::config::LOCAL_PROXY_HOST;
+use crate::store::StoredSettings;
 use crate::store::{load_auth, load_backup, load_settings, save_backup};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -14,7 +16,6 @@ pub struct CliToolStatus {
     pub installed: bool,
     pub binary: Option<String>,
     pub config_path: String,
-    pub switch_enabled: bool,
     pub base_url_field: String,
     pub token_field: String,
     pub install_url: String,
@@ -41,7 +42,7 @@ const CODEX_CONFIG_FIELDS: &[&str] = &[
 ];
 
 /// 备份中标记「注入前不存在」的占位值。
-const BACKUP_ABSENT: &str = "\0zd_switch_absent\0";
+const BACKUP_ABSENT: &str = "\0zwitch_absent\0";
 
 enum FieldValue {
     BaseUrl,
@@ -127,8 +128,11 @@ pub fn tool_ids() -> Vec<&'static str> {
     TOOLS.iter().map(|tool| tool.id).collect()
 }
 
-pub fn get_cli_tools_status(app: &AppHandle) -> Result<Vec<CliToolStatus>, String> {
-    let settings = load_settings(app)?;
+fn tool_should_inject(settings: &StoredSettings, tool: &ToolDefinition) -> bool {
+    settings.proxy_enabled && find_binary(tool.binaries).is_some()
+}
+
+pub fn get_cli_tools_status(_app: &AppHandle) -> Result<Vec<CliToolStatus>, String> {
     let home = dirs::home_dir().ok_or_else(|| "无法获取用户目录".to_string())?;
 
     Ok(TOOLS
@@ -142,11 +146,6 @@ pub fn get_cli_tools_status(app: &AppHandle) -> Result<Vec<CliToolStatus>, Strin
                 installed: binary.is_some(),
                 binary,
                 config_path: config_path.to_string_lossy().to_string(),
-                switch_enabled: settings
-                    .tool_switches
-                    .get(tool.id)
-                    .copied()
-                    .unwrap_or(false),
                 base_url_field: tool.base_url_field.to_string(),
                 token_field: tool.token_field.to_string(),
                 install_url: tool.install_url.to_string(),
@@ -159,39 +158,41 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
     let settings = load_settings(app)?;
     let auth = load_auth(app)?;
     let mut backup = load_backup(app)?;
+    let mut backup_dirty = false;
 
     let home = dirs::home_dir().ok_or_else(|| "无法获取用户目录".to_string())?;
 
-    let needs_inject = TOOLS.iter().any(|tool| {
-        settings.proxy_enabled
-            && settings
-                .tool_switches
-                .get(tool.id)
-                .copied()
-                .unwrap_or(false)
-            && find_binary(tool.binaries).is_some()
-    });
+    let needs_inject = TOOLS.iter().any(|tool| tool_should_inject(&settings, tool));
 
     if needs_inject && auth.authorization_code.is_none() {
         return Err("请先登录并完成设备授权".to_string());
     }
 
-    for tool in TOOLS {
-        let tool_enabled = settings.proxy_enabled
-            && settings
-                .tool_switches
-                .get(tool.id)
-                .copied()
-                .unwrap_or(false);
+    if needs_inject {
+        let preferred = detect_preferred_proxy_port(&home, &settings)?;
+        if let Ok(fingerprint) = crate::device::get_or_create_fingerprint(app) {
+            crate::proxy::ensure_listening(app.clone(), fingerprint, preferred);
+        }
+    }
 
+    let proxy_port = crate::proxy::local_port();
+
+    for tool in TOOLS {
+        let tool_enabled = tool_should_inject(&settings, tool);
         let installed = find_binary(tool.binaries).is_some();
-        let local_base = crate::proxy::local_proxy_base(tool.id);
+        let local_base = if proxy_port != 0 {
+            crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
+        } else {
+            crate::proxy::local_proxy_base(tool.id)
+        };
 
         for target in tool.targets {
             let config_path = home.join(target.relative);
 
             if !tool_enabled {
-                restore_config(app, &mut backup, tool, target, &config_path)?;
+                if restore_config(app, &mut backup, tool, target, &config_path)? {
+                    backup_dirty = true;
+                }
                 continue;
             }
 
@@ -199,12 +200,22 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
                 continue;
             }
 
-            backup_current_values(&mut backup, tool, target, &config_path)?;
+            let already_injected = read_config_if_exists(&config_path)
+                .map(|content| is_target_injected(tool, target, &content))
+                .unwrap_or(false);
+
+            if !already_injected {
+                backup_current_values(&mut backup, tool, target, &config_path)?;
+                backup_dirty = true;
+            }
+
             inject_values(target, &config_path, &local_base)?;
         }
     }
 
-    save_backup(app, &backup)?;
+    if backup_dirty {
+        save_backup(app, &backup)?;
+    }
     Ok(())
 }
 
@@ -245,8 +256,8 @@ fn backup_current_values(
 
     match target.format {
         ConfigFormat::Json => {
-            let value: Value = serde_json::from_str(&content)
-                .map_err(|e| format!("解析 JSON 失败: {e}"))?;
+            let value: Value =
+                serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
             for field in target.fields {
                 let backup_field_key = backup_key(tool.id, field.path);
                 if entry.contains_key(&backup_field_key) {
@@ -285,26 +296,127 @@ fn backup_current_values(
     Ok(())
 }
 
+fn read_config_if_exists(config_path: &Path) -> Option<String> {
+    if !config_path.exists() {
+        return None;
+    }
+    fs::read_to_string(config_path).ok()
+}
+
+fn is_local_proxy_base_url(url: &str, tool_id: &str) -> bool {
+    let prefix = format!("http://{LOCAL_PROXY_HOST}:");
+    url.starts_with(&prefix) && url.ends_with(&format!("/{tool_id}"))
+}
+
+fn is_target_injected(tool: &ToolDefinition, target: &ConfigTarget, content: &str) -> bool {
+    match target.format {
+        ConfigFormat::CodexProviderToml => is_zwitch_injected(content),
+        ConfigFormat::Json => serde_json::from_str::<Value>(content)
+            .ok()
+            .is_some_and(|value| {
+                target.fields.iter().any(|field| {
+                    read_json_field(&value, field.path)
+                        .is_some_and(|url| is_local_proxy_base_url(&url, tool.id))
+                })
+            }),
+        ConfigFormat::DotEnv => target.fields.iter().any(|field| {
+            read_dotenv_value(content, field.path)
+                .is_some_and(|url| is_local_proxy_base_url(&url, tool.id))
+        }),
+        ConfigFormat::Toml => target.fields.iter().any(|field| {
+            read_toml_value(content, field.path)
+                .is_some_and(|url| is_local_proxy_base_url(&url, tool.id))
+        }),
+    }
+}
+
+fn read_injected_proxy_port(
+    tool: &ToolDefinition,
+    target: &ConfigTarget,
+    content: &str,
+) -> Option<u16> {
+    if !is_target_injected(tool, target, content) {
+        return None;
+    }
+
+    match target.format {
+        ConfigFormat::CodexProviderToml => {
+            extract_toml_section(content, codex_provider_table_header())
+                .and_then(|body| read_toml_assignment(&body, "base_url"))
+                .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+        }
+        ConfigFormat::Json => serde_json::from_str::<Value>(content)
+            .ok()
+            .and_then(|value| {
+                target.fields.iter().find_map(|field| {
+                    read_json_field(&value, field.path)
+                        .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+                })
+            }),
+        ConfigFormat::DotEnv => target.fields.iter().find_map(|field| {
+            read_dotenv_value(content, field.path)
+                .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+        }),
+        ConfigFormat::Toml => target.fields.iter().find_map(|field| {
+            read_toml_value(content, field.path)
+                .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+        }),
+    }
+}
+
+fn detect_preferred_proxy_port(
+    home: &Path,
+    settings: &StoredSettings,
+) -> Result<Option<u16>, String> {
+    let mut ports = Vec::new();
+
+    for tool in TOOLS {
+        if !tool_should_inject(settings, tool) {
+            continue;
+        }
+
+        for target in tool.targets {
+            let config_path = home.join(target.relative);
+            let Some(content) = read_config_if_exists(&config_path) else {
+                continue;
+            };
+            if let Some(port) = read_injected_proxy_port(tool, target, &content) {
+                ports.push(port);
+            }
+        }
+    }
+
+    if ports.is_empty() {
+        return Ok(None);
+    }
+
+    let first = ports[0];
+    if ports.iter().all(|port| *port == first) {
+        Ok(Some(first))
+    } else {
+        Ok(Some(first))
+    }
+}
+
 fn restore_config(
     app: &AppHandle,
     backup: &mut crate::store::ConfigBackup,
     tool: &ToolDefinition,
     target: &ConfigTarget,
     config_path: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !config_path.exists() {
-        return Ok(());
+        return Ok(false);
     }
 
     let file_key = config_path.to_string_lossy().to_string();
     let file_backup = match backup.files.get(&file_key) {
         Some(entry) => entry.clone(),
         None if matches!(target.format, ConfigFormat::CodexProviderToml) => HashMap::new(),
-        None => return Ok(()),
+        None => return Ok(false),
     };
 
-    let mut content = fs::read_to_string(config_path)
-        .map_err(|e| format!("读取配置失败: {e}"))?;
+    let mut content = fs::read_to_string(config_path).map_err(|e| format!("读取配置失败: {e}"))?;
 
     for field in target.fields {
         let key = backup_key(tool.id, field.path);
@@ -339,19 +451,14 @@ fn restore_config(
 
     write_config(config_path, &content)?;
     save_backup(app, backup)?;
-    Ok(())
+    Ok(true)
 }
 
-fn inject_values(
-    target: &ConfigTarget,
-    config_path: &Path,
-    base_url: &str,
-) -> Result<(), String> {
+fn inject_values(target: &ConfigTarget, config_path: &Path, base_url: &str) -> Result<(), String> {
     ensure_parent(config_path)?;
 
     let content = if config_path.exists() {
-        fs::read_to_string(config_path)
-            .map_err(|e| format!("读取配置失败: {e}"))?
+        fs::read_to_string(config_path).map_err(|e| format!("读取配置失败: {e}"))?
     } else {
         match target.format {
             ConfigFormat::Json => "{}".to_string(),
@@ -382,11 +489,8 @@ fn inject_values(
         ConfigFormat::Toml => {
             let mut result = content;
             for field in target.fields {
-                result = write_toml_value(
-                    &result,
-                    field.path,
-                    &resolve_field_value(field, base_url),
-                )?;
+                result =
+                    write_toml_value(&result, field.path, &resolve_field_value(field, base_url))?;
             }
             result
         }
@@ -394,11 +498,8 @@ fn inject_values(
         ConfigFormat::DotEnv => {
             let mut result = content;
             for field in target.fields {
-                result = write_dotenv_value(
-                    &result,
-                    field.path,
-                    &resolve_field_value(field, base_url),
-                )?;
+                result =
+                    write_dotenv_value(&result, field.path, &resolve_field_value(field, base_url))?;
             }
             result
         }
@@ -519,12 +620,8 @@ fn codex_config_fields() -> &'static [&'static str] {
     CODEX_CONFIG_FIELDS
 }
 
-fn backup_codex_provider_toml(
-    entry: &mut HashMap<String, String>,
-    tool_id: &str,
-    content: &str,
-) {
-    if is_zd_switch_injected(content) {
+fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str, content: &str) {
+    if is_zwitch_injected(content) {
         return;
     }
 
@@ -562,7 +659,7 @@ fn backup_codex_provider_toml(
     }
 }
 
-fn is_zd_switch_injected(content: &str) -> bool {
+fn is_zwitch_injected(content: &str) -> bool {
     extract_toml_section(content, codex_provider_table_header()).is_some()
         && read_top_level_toml_value(content, "model_provider").as_deref()
             == Some(CODEX_MODEL_PROVIDER)
@@ -994,8 +1091,7 @@ mod tests {
 
     #[test]
     fn codex_inject_writes_provider_section() {
-        let injected =
-            inject_codex_provider_config("", "http://127.0.0.1:51805/codex").unwrap();
+        let injected = inject_codex_provider_config("", "http://127.0.0.1:51805/codex").unwrap();
         assert_eq!(
             injected,
             r#"model_provider = "zsdx_ai"
@@ -1081,10 +1177,7 @@ model = "gpt-5.4"
         )
         .unwrap();
         let restored = restore_codex_provider_toml(&injected, "codex", &HashMap::new()).unwrap();
-        assert_eq!(
-            restored,
-            "disable_response_storage = true\n"
-        );
+        assert_eq!(restored, "disable_response_storage = true\n");
     }
 
     #[test]
@@ -1107,12 +1200,14 @@ base_url = "http://old.example/codex"
 
     #[test]
     fn codex_backup_skips_already_injected_config() {
-        let injected =
-            inject_codex_provider_config("", "http://127.0.0.1:51805/codex").unwrap();
+        let injected = inject_codex_provider_config("", "http://127.0.0.1:51805/codex").unwrap();
         let mut backup = HashMap::new();
         backup.insert("codex::model".into(), BACKUP_ABSENT.into());
         backup_codex_provider_toml(&mut backup, "codex", &injected);
-        assert_eq!(backup.get("codex::model").map(String::as_str), Some(BACKUP_ABSENT));
+        assert_eq!(
+            backup.get("codex::model").map(String::as_str),
+            Some(BACKUP_ABSENT)
+        );
         assert!(!backup.contains_key("codex::snapshot"));
     }
 
@@ -1132,6 +1227,16 @@ base_url = "http://old.example/codex"
         assert_eq!(GEMINI_TARGETS[0].relative, ".gemini/.env");
         assert_eq!(GEMINI_TARGETS[0].fields[0].path, "GOOGLE_GEMINI_BASE_URL");
         assert_eq!(GEMINI_TARGETS[0].fields.len(), 1);
+    }
+
+    #[test]
+    fn detects_claude_local_proxy_injection() {
+        let content = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:51805/claude"}}"#;
+        assert!(is_target_injected(&TOOLS[1], &CLAUDE_TARGETS[0], content));
+        assert_eq!(
+            read_injected_proxy_port(&TOOLS[1], &CLAUDE_TARGETS[0], content),
+            Some(51805)
+        );
     }
 
     #[test]

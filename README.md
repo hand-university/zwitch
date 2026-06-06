@@ -1,11 +1,11 @@
-# ZD Switch
+# ZWitch
 
 Tauri 桌面应用，用于 OAuth 登录后获取 API Key，并通过开关向 Codex、Claude Code、Gemini CLI 注入 `base_url` 与 `token`。
 
 ## 登录流程
 
-1. 使用系统默认浏览器打开登录页，并附带 `source=zd-switch` 参数，例如：
-   `http://localhost:8080/login?source=zd-switch`
+1. 使用系统默认浏览器打开登录页，并附带 `source=zwitch` 参数，例如：
+   `http://localhost:8080/login?source=zwitch`
 2. 登录完成后，登录服务通过 Deep Link 唤起应用并回传 `access_token`
 3. 应用用该 `access_token` + 设备指纹向后端注册设备，换取一个**持久授权码**（authorization_code）
 4. 之后应用用授权码独立续期 `access_token` / `api_key`，不再依赖与 web 共用的短期 token
@@ -27,10 +27,10 @@ Tauri 桌面应用，用于 OAuth 登录后获取 API Key，并通过开关向 C
 登录成功后，请重定向到 Deep Link：
 
 ```
-zd-switch://open?access_token=YOUR_ACCESS_TOKEN
+zwitch://open?access_token=YOUR_ACCESS_TOKEN
 ```
 
-首次启动应用时会自动向 macOS 注册 `zd-switch://` scheme（`tauri dev` 同样生效）。若浏览器仍提示未注册 handler，请完全退出应用后重新运行 `npm run tauri dev`。
+首次启动应用时会自动向 macOS 注册 `zwitch://` scheme（`tauri dev` 同样生效）。若浏览器仍提示未注册 handler，请完全退出应用后重新运行 `npm run tauri dev`。
 
 ## 功能
 

@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const LSREGISTER: &str = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
-const DEV_APP_NAME: &str = "ZD Switch Dev.app";
-const DEV_BUNDLE_ID: &str = "com.zhangqiang.zd-switch";
+const DEV_APP_NAME: &str = "ZWitch Dev.app";
+const DEV_BUNDLE_ID: &str = "com.zhangqiang.zwitch";
 
 pub fn ensure_url_scheme_registered() -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
@@ -17,7 +17,8 @@ pub fn ensure_url_scheme_registered() -> Result<(), String> {
     {
         if cfg!(debug_assertions) {
             unregister_legacy_handlers();
-            let exe = std::env::current_exe().map_err(|e| format!("无法获取当前可执行文件: {e}"))?;
+            let exe =
+                std::env::current_exe().map_err(|e| format!("无法获取当前可执行文件: {e}"))?;
             ensure_dev_app_bundle(&exe)?;
         }
         Ok(())
@@ -49,9 +50,7 @@ pub fn reexec_from_dev_app_if_needed() {
             return;
         };
 
-        let app_exe = target_dir
-            .join(DEV_APP_NAME)
-            .join("Contents/MacOS/zd-switch");
+        let app_exe = target_dir.join(DEV_APP_NAME).join("Contents/MacOS/zwitch");
 
         if !app_exe.exists() {
             return;
@@ -70,9 +69,9 @@ pub fn ensure_dev_app_bundle(exe: &Path) -> Result<(), String> {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    let target_dir = target_debug_dir(exe)
-        .ok_or_else(|| "无法定位 target/debug 目录".to_string())?;
-    let binary = target_dir.join("zd-switch");
+    let target_dir =
+        target_debug_dir(exe).ok_or_else(|| "无法定位 target/debug 目录".to_string())?;
+    let binary = target_dir.join("zwitch");
 
     if !binary.exists() {
         return Err(format!("Dev 二进制不存在: {}", binary.display()));
@@ -81,7 +80,7 @@ pub fn ensure_dev_app_bundle(exe: &Path) -> Result<(), String> {
     let app_dir = target_dir.join(DEV_APP_NAME);
     let contents = app_dir.join("Contents");
     let macos_dir = contents.join("MacOS");
-    let exe_link = macos_dir.join("zd-switch");
+    let exe_link = macos_dir.join("zwitch");
     let info_plist = contents.join("Info.plist");
 
     fs::create_dir_all(&macos_dir).map_err(|e| format!("创建 Dev.app 目录失败: {e}"))?;
@@ -92,11 +91,11 @@ pub fn ensure_dev_app_bundle(exe: &Path) -> Result<(), String> {
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key>
-  <string>zd-switch</string>
+  <string>zwitch</string>
   <key>CFBundleIdentifier</key>
   <string>{DEV_BUNDLE_ID}</string>
   <key>CFBundleName</key>
-  <string>ZD Switch Dev</string>
+  <string>ZWitch Dev</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleVersion</key>
@@ -145,7 +144,7 @@ fn register_app_bundle(app_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("执行 lsregister 失败: {e}"))?;
 
     if !status.success() {
-        return Err("lsregister 注册 zd-switch:// URL scheme 失败".into());
+        return Err("lsregister 注册 zwitch:// URL scheme 失败".into());
     }
 
     Ok(())
@@ -154,21 +153,31 @@ fn register_app_bundle(app_dir: &Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn unregister_legacy_handlers() {
     if let Some(home) = dirs::home_dir() {
-        let legacy = home.join("Library/Application Support/zd-switch/ZD Switch.app");
-        if legacy.exists() {
-            let _ = Command::new(LSREGISTER)
-                .args(["-u", &legacy.to_string_lossy()])
-                .status();
+        for legacy in [
+            home.join("Library/Application Support/zd-switch/ZD Switch.app"),
+            home.join("Library/Application Support/zwitch/ZWitch.app"),
+        ] {
+            if legacy.exists() {
+                let _ = Command::new(LSREGISTER)
+                    .args(["-u", &legacy.to_string_lossy()])
+                    .status();
+            }
         }
     }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(target_dir) = target_debug_dir(&exe) {
-            let url_handler = target_dir.join("deeplink").join("ZD Switch URL Handler.app");
-            if url_handler.exists() {
-                let _ = Command::new(LSREGISTER)
-                    .args(["-u", &url_handler.to_string_lossy()])
-                    .status();
+            for url_handler in [
+                target_dir
+                    .join("deeplink")
+                    .join("ZD Switch URL Handler.app"),
+                target_dir.join("deeplink").join("ZWitch URL Handler.app"),
+            ] {
+                if url_handler.exists() {
+                    let _ = Command::new(LSREGISTER)
+                        .args(["-u", &url_handler.to_string_lossy()])
+                        .status();
+                }
             }
         }
     }

@@ -13,6 +13,8 @@
     "store:allow-save",
     "store:allow-load",
     "deep-link:default",
+    "updater:default",
+    "process:default",
     "allow-app-commands"
   ]
 }
