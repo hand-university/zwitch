@@ -10,7 +10,34 @@ permissions:
   contents: write
 
 jobs:
+  build-frontend:
+    runs-on: ubuntu-22.04
+    name: Build frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Upload frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+          if-no-files-found: error
+
   build:
+    needs: build-frontend
     strategy:
       fail-fast: false
       matrix:
@@ -35,9 +62,19 @@ jobs:
     runs-on: ${{ matrix.platform }}
     name: Build (${{ matrix.label }})
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -56,6 +93,9 @@ jobs:
           node-version: lts/*
           cache: npm
 
+      - name: Install Tauri CLI dependencies
+        run: npm ci
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -66,17 +106,13 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      - name: Install frontend dependencies
-        run: npm ci
-
-      # 私钥仅通过 GitHub Secrets 注入，不得存放在仓库内。
-      # 在仓库 Settings → Secrets 配置 TAURI_SIGNING_PRIVATE_KEY（minisign 私钥全文）。
+      # 前端已在 build-frontend 任务中构建，此处跳过 beforeBuildCommand。
       - name: Build Tauri app
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm run tauri build -- ${{ matrix.args }}
+        run: npm run tauri build -- --config '{"build":{"beforeBuildCommand":""}}' ${{ matrix.args }}
 
       - name: Build and publish release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -91,7 +127,7 @@ jobs:
           releaseBody: Desktop builds for Linux x64, macOS arm64/x64, and Windows x64.
           releaseDraft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          args: --config '{"build":{"beforeBuildCommand":""}}' ${{ matrix.args }}
 
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
