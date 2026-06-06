@@ -37,7 +37,7 @@
       ]
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRCNUQ5RDM3RDY1NDgzOEMKUldTTWcxVFdONTFkUzRKZ0hhMXNEcXMrby9iakFMcGNjR1F1TTZRd1MyZWtkb1NqVmVMNTMvdXMK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcyNEZEMUY1ODQ2RTEyREEKUldUYUVtNkU5ZEZQY2l2Mnh2ckFRR1pzQ1dqcVI0eTUxTlBVOXhrdTlCNXBVNjdyQjVVazdtYWsK",
       "endpoints": [
         "https://ft-app.wxhand.com/zai/api/aone/zwitch/updates/{{target}}/{{arch}}/{{current_version}}"
       ]
