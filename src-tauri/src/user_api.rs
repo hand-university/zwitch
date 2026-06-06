@@ -1,4 +1,6 @@
-use crate::config::{DEVICE_AUTHORIZE_PATH, DEVICE_REVOKE_PATH, DEVICE_TOKEN_PATH};
+use crate::config::{
+    AppConfig, DEVICE_AUTHORIZE_PATH, DEVICE_REVOKE_PATH, DEVICE_TOKEN_PATH,
+};
 use serde::Deserialize;
 
 /// 接口错误分类，便于上层区分"静默续期"与"强制重新登录"。
@@ -83,14 +85,94 @@ pub fn normalize_api_base_url(raw: &str) -> Option<String> {
         None => host.to_string(),
     };
 
-    let mut origin = format!("{}://{}", parsed.scheme(), authority);
-
-    #[cfg(debug_assertions)]
-    if origin == "http://localhost" || origin == "https://localhost" {
-        origin = crate::config::API_BASE_URL.to_string();
+    let path = parsed.path().trim_end_matches('/');
+    let mut base = format!("{}://{}", parsed.scheme(), authority);
+    if !path.is_empty() && path != "/" {
+        base.push_str(path);
     }
 
-    Some(origin)
+    #[cfg(debug_assertions)]
+    if base == "http://localhost" || base == "https://localhost" {
+        base = crate::config::API_BASE_URL.to_string();
+    }
+
+    Some(enforce_https_for_remote(base))
+}
+
+fn is_origin_only_api_base(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let path = parsed.path().trim_end_matches('/');
+    path.is_empty() || path == "/"
+}
+
+fn is_dev_only_api_base(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(
+        parsed.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
+}
+
+fn url_hosts_match(a: &url::Url, b: &url::Url) -> bool {
+    // 仅比较 host；release 会将 http 升级为 https，默认端口不同不应影响路径补全。
+    a.host_str() == b.host_str()
+}
+
+/// release 构建将远程 http 地址升级为 https（本地开发地址除外）。
+#[cfg(not(debug_assertions))]
+fn enforce_https_for_remote(url: String) -> String {
+    if is_dev_only_api_base(&url) {
+        return url;
+    }
+    let Ok(mut parsed) = url::Url::parse(&url) else {
+        return url;
+    };
+    if parsed.scheme() != "http" {
+        return url;
+    }
+    let _ = parsed.set_scheme("https");
+    if parsed.port() == Some(80) {
+        let _ = parsed.set_port(None);
+    }
+    parsed.to_string()
+}
+
+#[cfg(debug_assertions)]
+fn enforce_https_for_remote(url: String) -> String {
+    url
+}
+
+/// 解析实际请求的 API 根地址：release 构建忽略本地开发地址。
+pub fn resolve_api_base_url(stored: Option<&str>) -> String {
+    let default = AppConfig::default().api_base_url;
+    let Some(normalized) = stored.and_then(normalize_api_base_url) else {
+        return enforce_https_for_remote(default);
+    };
+
+    #[cfg(not(debug_assertions))]
+    {
+        if is_dev_only_api_base(&normalized) {
+            return enforce_https_for_remote(default);
+        }
+        // 旧版会把 /zai 路径剥掉，仅保留域名；与默认 API 同 host 时补全路径前缀。
+        if is_origin_only_api_base(&normalized) {
+            let Ok(default_url) = url::Url::parse(&default) else {
+                return enforce_https_for_remote(normalized);
+            };
+            let Ok(stored_url) = url::Url::parse(&normalized) else {
+                return enforce_https_for_remote(normalized);
+            };
+            if url_hosts_match(&default_url, &stored_url) {
+                return enforce_https_for_remote(default);
+            }
+        }
+    }
+
+    enforce_https_for_remote(normalized)
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,28 +279,41 @@ pub async fn fetch_user_me(
     let url = format!("{}/api/aone/users/me", api_base_url.trim_end_matches('/'));
 
     let response = reqwest::Client::new()
-        .get(url)
+        .get(&url)
         .header("Authorization", format!("Bearer {session_token}"))
         .header("Cookie", format!("token={session_token}"))
         .send()
         .await
         .map_err(|e| ApiError::Other(format!("请求用户信息失败: {e}")))?;
 
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(ApiError::Unauthorized);
     }
-    if !response.status().is_success() {
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| ApiError::Other(format!("读取用户信息失败: {e}（请求地址: {url}）")))?;
+
+    if !status.is_success() {
         return Err(ApiError::Other(format!(
-            "获取用户信息失败: HTTP {}",
-            response.status()
+            "获取用户信息失败: HTTP {status}（请求地址: {url}）"
         )));
     }
 
-    response
-        .json::<UserMeResponse>()
-        .await
-        .map(|body| body.into_profile())
-        .map_err(|e| ApiError::Other(format!("解析用户信息失败: {e}")))
+    serde_json::from_str::<UserMeResponse>(&body)
+        .map(|parsed| parsed.into_profile())
+        .map_err(|e| ApiError::Other(format!(
+            "解析用户信息失败: {e}（请求地址: {url}，Content-Type: {content_type}）"
+        )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,4 +454,51 @@ fn device_name() -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::consts::OS.to_string());
     format!("zwitch ({host})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_api_base_url_keeps_path_prefix() {
+        assert_eq!(
+            normalize_api_base_url("https://ft-app.wxhand.com/zai/"),
+            Some("https://ft-app.wxhand.com/zai".to_string())
+        );
+        assert_eq!(
+            normalize_api_base_url("https://ft-app.wxhand.com/zai"),
+            Some("https://ft-app.wxhand.com/zai".to_string())
+        );
+    }
+
+    #[test]
+    fn normalize_api_base_url_keeps_port() {
+        assert_eq!(
+            normalize_api_base_url("http://localhost:8080/zai"),
+            Some("http://localhost:8080/zai".to_string())
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn resolve_api_base_url_restores_missing_path_prefix_in_release() {
+        assert_eq!(
+            resolve_api_base_url(Some("https://ft-app.wxhand.com")),
+            AppConfig::default().api_base_url
+        );
+        assert_eq!(
+            resolve_api_base_url(Some("http://ft-app.wxhand.com")),
+            AppConfig::default().api_base_url
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn resolve_api_base_url_upgrades_http_to_https_in_release() {
+        assert_eq!(
+            resolve_api_base_url(Some("http://ft-app.wxhand.com/zai")),
+            "https://ft-app.wxhand.com/zai"
+        );
+    }
 }

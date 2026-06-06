@@ -94,14 +94,44 @@ impl AppConfig {
         format!("{}://{}", self.deeplink_scheme, self.deeplink_host)
     }
 
+    /// release 使用经 https 规范化后的公共 base URL。
+    pub fn resolved_public_base_url(&self) -> String {
+        crate::user_api::resolve_api_base_url(Some(self.api_base_url.as_str()))
+    }
+
+    /// 打开系统浏览器登录页：`{BASE_URL}/login?source=zwitch`
     pub fn login_url(&self) -> Result<String, String> {
-        let mut url = url::Url::parse(&format!(
-            "{}/login",
-            self.login_base_url.trim_end_matches('/')
-        ))
-        .map_err(|e| format!("无效的登录 URL: {e}"))?;
-        url.query_pairs_mut()
-            .append_pair("source", &self.login_source);
+        let base = self.resolved_public_base_url();
+        let mut url = url::Url::parse(&format!("{}/login", base.trim_end_matches('/')))
+            .map_err(|e| format!("无效的登录 URL: {e}"))?;
+        url.query_pairs_mut().append_pair("source", &self.login_source);
         Ok(url.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_url_uses_https_base_in_release() {
+        let config = AppConfig::default();
+        let url = config.login_url().expect("login url");
+        assert!(url.contains("source=zwitch"));
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(
+                url,
+                "https://ft-app.wxhand.com/zai/login?source=zwitch",
+                "unexpected login url"
+            );
+        }
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                url.starts_with("http://localhost:8080/login"),
+                "unexpected login url: {url}"
+            );
+        }
     }
 }

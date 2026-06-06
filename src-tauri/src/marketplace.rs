@@ -5,7 +5,6 @@ use crate::codex_plugins::{
     scan_codex_installed_plugins as import_codex_plugins_from_config,
     sync_codex_plugin_enabled_states,
 };
-use crate::config::AppConfig;
 use crate::store::{
     load_auth, load_marketplace_registry, save_marketplace_registry, MarketplaceItemRecord,
 };
@@ -657,7 +656,7 @@ fn sync_claude_plugin_enabled_states(registry: &mut crate::store::MarketplaceReg
 async fn fetch_remote_items(app: &AppHandle) -> Result<Vec<RemoteItem>, String> {
     let auth = load_auth(app)?;
     if auth.authorization_code.is_none() {
-        return Err("请先登录".into());
+        return Err(auth::fail_auth_session(app, "请先登录"));
     }
 
     let base = resolve_api_base_url(&auth);
@@ -674,9 +673,16 @@ async fn fetch_remote_items(app: &AppHandle) -> Result<Vec<RemoteItem>, String> 
         .map_err(|e| format!("请求市场条目失败: {e}"))?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let refreshed = auth::force_refresh_session_token(app)
-            .await
-            .map_err(|e| e.message())?;
+        let refreshed = match auth::force_refresh_session_token(app).await {
+            Ok(token) => token,
+            Err(crate::user_api::ApiError::AuthCodeRejected) => {
+                return Err(auth::fail_auth_session(
+                    app,
+                    crate::user_api::ApiError::AuthCodeRejected.message(),
+                ));
+            }
+            Err(e) => return Err(e.message()),
+        };
         response = client
             .get(&url)
             .header("Authorization", format!("Bearer {refreshed}"))
@@ -684,6 +690,12 @@ async fn fetch_remote_items(app: &AppHandle) -> Result<Vec<RemoteItem>, String> 
             .send()
             .await
             .map_err(|e| format!("请求市场条目失败: {e}"))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(auth::fail_auth_session(
+                app,
+                crate::user_api::ApiError::Unauthorized.message(),
+            ));
+        }
     }
 
     if !response.status().is_success() {
@@ -1532,10 +1544,7 @@ fn home_dir() -> Result<PathBuf, String> {
 }
 
 fn resolve_api_base_url(auth: &crate::store::StoredAuth) -> String {
-    auth.api_base_url
-        .as_deref()
-        .and_then(crate::user_api::normalize_api_base_url)
-        .unwrap_or_else(|| AppConfig::default().api_base_url)
+    crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref())
 }
 
 fn is_valid_item_dir(path: &Path, platform: &str, item_type: &str) -> bool {

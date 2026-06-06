@@ -27,7 +27,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { MarketplacePage } from "@/pages/MarketplacePage";
 import { AboutPage } from "@/pages/AboutPage";
 import { QuickStartPage } from "@/pages/QuickStartPage";
-import { isDev } from "@/config/env";
+import { reportApiError } from "@/lib/auth";
 import type {
   AppPage,
   AuthState,
@@ -103,6 +103,20 @@ export default function App() {
     setExploreItems(items);
   }, []);
 
+  const applyLoggedOut = useCallback((nextAuth: AuthState = defaultAuth) => {
+    setAuth(nextAuth);
+    setTools([]);
+    setMarketplaceItems([]);
+    setExploreItems([]);
+    setProxyEnabledState(false);
+    setActivePage("quick-start");
+  }, []);
+
+  const handleApiError = useCallback(
+    (error: unknown) => reportApiError(error, applyLoggedOut),
+    [applyLoggedOut],
+  );
+
   const refresh = useCallback(async () => {
     setBusy(true);
     try {
@@ -115,27 +129,28 @@ export default function App() {
         }
       }
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
-  }, [refreshTools, loadExploreItems, activePage]);
+  }, [refreshTools, loadExploreItems, activePage, handleApiError]);
 
   const refreshProfile = useCallback(async () => {
     setBusy(true);
     try {
       const authState = await refreshUserProfile();
-      setAuth(authState);
       if (authState.is_logged_in) {
+        setAuth(authState);
         await refreshTools();
+      } else {
+        applyLoggedOut(authState);
       }
-      // 若已登出（设备授权失效），保留后端通过 login-failed 推送的提示
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
-  }, [refreshTools]);
+  }, [refreshTools, applyLoggedOut, handleApiError]);
 
   useEffect(() => {
     (async () => {
@@ -155,19 +170,23 @@ export default function App() {
 
   useEffect(() => {
     const unlistenAuth = onAuthChanged((state) => {
-      setAuth(state);
-      refreshTools().catch((e) => message.error(String(e)));
+      if (state.is_logged_in) {
+        setAuth(state);
+        refreshTools().catch((e) => handleApiError(e));
+      } else {
+        applyLoggedOut(state);
+      }
     });
 
     const unlistenFail = onLoginFailed((text) => {
-      message.error(text);
+      void reportApiError(text, applyLoggedOut);
     });
 
     return () => {
       unlistenAuth.then((fn) => fn());
       unlistenFail.then((fn) => fn());
     };
-  }, [refreshTools]);
+  }, [refreshTools, applyLoggedOut, handleApiError]);
 
   useEffect(() => {
     if (!auth.is_logged_in || activePage !== "explore") {
@@ -175,9 +194,9 @@ export default function App() {
     }
     setBusy(true);
     loadExploreItems()
-      .catch((e) => message.error(String(e)))
+      .catch((e) => handleApiError(e))
       .finally(() => setBusy(false));
-  }, [auth.is_logged_in, activePage, loadExploreItems]);
+  }, [auth.is_logged_in, activePage, loadExploreItems, handleApiError]);
 
   const handleLogin = async () => {
     try {
@@ -191,8 +210,8 @@ export default function App() {
     setBusy(true);
     try {
       await logout();
-      setAuth(defaultAuth);
-      setTools([]);
+      applyLoggedOut();
+      message.info("已退出登录");
     } catch (e) {
       message.error(String(e));
     } finally {
@@ -206,7 +225,7 @@ export default function App() {
       await setProxyEnabled(enabled);
       await refreshTools();
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
@@ -218,7 +237,7 @@ export default function App() {
       await syncMarketplace();
       await Promise.all([refreshTools(), loadExploreItems()]);
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
@@ -230,11 +249,11 @@ export default function App() {
       await scanLocalMarketplace();
       await refreshTools();
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
-  }, [refreshTools]);
+  }, [refreshTools, handleApiError]);
 
   const handleMarketplaceToggle = async (
     item: MarketplaceItem,
@@ -250,7 +269,7 @@ export default function App() {
       );
       await refreshTools();
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
@@ -262,7 +281,7 @@ export default function App() {
       await installMarketplaceItem(item.platform, item.item_type, item.name);
       await Promise.all([refreshTools(), loadExploreItems()]);
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
@@ -284,7 +303,7 @@ export default function App() {
       );
       await Promise.all([refreshTools(), loadExploreItems()]);
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
@@ -297,11 +316,11 @@ export default function App() {
     try {
       await loadExploreItems();
     } catch (e) {
-      message.error(String(e));
+      await handleApiError(e);
     } finally {
       setBusy(false);
     }
-  }, [loadExploreItems]);
+  }, [loadExploreItems, handleApiError]);
 
   const headerActions =
     activePage === "quick-start" ? (
@@ -339,7 +358,7 @@ export default function App() {
         activePage={activePage}
         navItems={NAV_ITEMS}
         onNavigate={setActivePage}
-        onLogout={isDev ? handleLogout : undefined}
+        onLogout={handleLogout}
       >
         <Header
           title={pageMeta.title}

@@ -36,20 +36,40 @@ fn auth_to_state(auth: &StoredAuth) -> AuthState {
 }
 
 fn resolve_api_base_url(auth: &StoredAuth) -> String {
-    auth.api_base_url
-        .as_deref()
-        .and_then(crate::user_api::normalize_api_base_url)
-        .unwrap_or_else(|| AppConfig::default().api_base_url)
+    crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref())
+}
+
+fn clear_logged_in_state(app: &AppHandle) -> Result<AuthState, String> {
+    crate::proxy::clear_credential_cache();
+    let _ = crate::cli_tools::apply_config_injection(app);
+    clear_auth(app)?;
+    emit_auth_changed(app)
 }
 
 pub fn logout(app: &AppHandle) -> Result<(), String> {
     revoke_current_device(app);
-    crate::proxy::clear_credential_cache();
-
-    let _ = crate::cli_tools::apply_config_injection(app);
-    clear_auth(app)?;
-    emit_auth_changed(app)?;
+    clear_logged_in_state(app)?;
     Ok(())
+}
+
+/// 授权失效时清理本地登录态并通知前端回到登录页。
+pub fn force_logout(app: &AppHandle, reason: &str) -> Result<AuthState, String> {
+    let state = clear_logged_in_state(app)?;
+    emit_login_failed(app, reason);
+    Ok(state)
+}
+
+/// 会话失效时强制登出并返回错误文案（已有登录态才清理，避免未登录时误报）。
+pub fn fail_auth_session(app: &AppHandle, reason: impl Into<String>) -> String {
+    let reason = reason.into();
+    if load_auth(app)
+        .ok()
+        .and_then(|auth| auth.authorization_code)
+        .is_some()
+    {
+        let _ = force_logout(app, &reason);
+    }
+    reason
 }
 
 /// 后台尽力吊销授权码，让后端解除设备绑定；失败不阻断本地登出。
@@ -104,13 +124,15 @@ pub async fn refresh_user_profile(app: &AppHandle) -> Result<AuthState, String> 
     match sync_profile(app).await {
         Ok(_) => emit_auth_changed(app),
         Err(ApiError::AuthCodeRejected) => {
-            // 授权码被后端拒绝（登出/禁用/解绑），强制重新登录。
-            crate::proxy::clear_credential_cache();
-            clear_auth(app)?;
-            let state = emit_auth_changed(app)?;
-            emit_login_failed(app, &ApiError::AuthCodeRejected.message());
-            Ok(state)
+            Ok(force_logout(
+                app,
+                &ApiError::AuthCodeRejected.message(),
+            )?)
         }
+        Err(ApiError::Unauthorized) => Ok(force_logout(
+            app,
+            &ApiError::Unauthorized.message(),
+        )?),
         Err(e) => Err(e.message()),
     }
 }
@@ -152,15 +174,20 @@ async fn sync_profile(app: &AppHandle) -> Result<(), ApiError> {
 pub async fn resolve_session_token(app: &AppHandle) -> Result<String, String> {
     let auth = load_auth(app)?;
     if auth.authorization_code.is_none() {
-        return Err("请先登录".into());
+        return Err(fail_auth_session(app, "请先登录"));
     }
     let base = resolve_api_base_url(&auth);
     if let Some(token) = auth.access_token.clone() {
         return Ok(token);
     }
-    refresh_access_token(app, &auth, &base)
-        .await
-        .map_err(|e| e.message())
+    match refresh_access_token(app, &auth, &base).await {
+        Ok(token) => Ok(token),
+        Err(ApiError::AuthCodeRejected) => {
+            force_logout(app, &ApiError::AuthCodeRejected.message())?;
+            Err(ApiError::AuthCodeRejected.message())
+        }
+        Err(e) => Err(e.message()),
+    }
 }
 
 /// 强制用授权码换取新的 access_token。
@@ -186,26 +213,33 @@ async fn refresh_access_token(
 
     let mut updated = load_auth(app).map_err(ApiError::Other)?;
     updated.access_token = Some(resp.access_token.clone());
-    if let Some(new_base) = resp
-        .base_url
-        .as_deref()
-        .and_then(crate::user_api::normalize_api_base_url)
-    {
-        updated.api_base_url = Some(new_base);
+    if resp.base_url.is_some() {
+        updated.api_base_url =
+            Some(crate::user_api::resolve_api_base_url(resp.base_url.as_deref()));
     }
     save_auth(app, &updated).map_err(ApiError::Other)?;
 
     Ok(resp.access_token)
 }
 
+/// 登录回调里的 base_url 可能为 http 或缺少 /zai；release 统一使用应用配置的 https 地址。
+fn resolve_login_api_base_url(deeplink_base: Option<&str>) -> String {
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = deeplink_base;
+        return crate::user_api::resolve_api_base_url(None);
+    }
+    #[cfg(debug_assertions)]
+    {
+        crate::user_api::resolve_api_base_url(deeplink_base)
+    }
+}
+
 async fn complete_login(
     app: &AppHandle,
     payload: crate::user_api::DeepLinkAuth,
 ) -> Result<(), String> {
-    let api_base_url = payload
-        .api_base_url
-        .clone()
-        .unwrap_or_else(|| AppConfig::default().api_base_url);
+    let api_base_url = resolve_login_api_base_url(payload.api_base_url.as_deref());
 
     let fingerprint = device::get_or_create_fingerprint(app)?;
 

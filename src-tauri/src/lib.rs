@@ -190,7 +190,14 @@ pub fn run() {
         ])
         .setup(|app| {
             macos_scheme::ensure_url_scheme_registered()?;
-            let _ = store::load_auth(app.handle());
+            if let Ok(mut auth) = store::load_auth(app.handle()) {
+                let effective =
+                    user_api::resolve_api_base_url(auth.api_base_url.as_deref());
+                if auth.api_base_url.as_deref() != Some(effective.as_str()) {
+                    auth.api_base_url = Some(effective);
+                    let _ = store::save_auth(app.handle(), &auth);
+                }
+            }
             // 总开关每次启动默认为关闭，并还原 CLI 配置。
             {
                 let mut settings = store::load_settings(app.handle())?;

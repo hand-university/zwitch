@@ -5,8 +5,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,10 +222,169 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// GUI 应用启动时 PATH 往往不含 Homebrew / fnm 等目录，需扩展后再查找。
+fn executable_search_path() -> &'static OsStr {
+    static PATH: OnceLock<OsString> = OnceLock::new();
+    PATH.get_or_init(|| {
+        OsString::from(
+            collect_executable_search_dirs()
+                .into_iter()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(if cfg!(windows) { ";" } else { ":" }),
+        )
+    })
+    .as_os_str()
+}
+
+fn collect_executable_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |dir: PathBuf| {
+        if dir.as_os_str().is_empty() || !seen.insert(dir.clone()) {
+            return;
+        }
+        dirs.push(dir);
+    };
+
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            push(dir);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    append_macos_system_paths(&mut push);
+
+    if let Some(home) = dirs::home_dir() {
+        for suffix in [
+            ".local/bin",
+            ".cargo/bin",
+            ".bun/bin",
+            ".npm-global/bin",
+            "bin",
+        ] {
+            push(home.join(suffix));
+        }
+        append_version_manager_bin_dirs(&home, &mut push);
+    }
+
+    push(PathBuf::from("/opt/homebrew/bin"));
+    push(PathBuf::from("/opt/homebrew/sbin"));
+    push(PathBuf::from("/usr/local/bin"));
+
+    #[cfg(target_os = "macos")]
+    for dir in macos_login_shell_path_dirs() {
+        push(dir);
+    }
+
+    dirs
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_system_paths(push: &mut impl FnMut(PathBuf)) {
+    if let Ok(content) = fs::read_to_string("/etc/paths") {
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                push(PathBuf::from(line));
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir("/etc/paths.d") {
+        for entry in entries.flatten() {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        push(PathBuf::from(line));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 扫描 fnm / nvm / volta / mise / asdf 等工具链目录下的 bin。
+fn append_version_manager_bin_dirs(home: &Path, push: &mut impl FnMut(PathBuf)) {
+    append_nested_bin_dirs(
+        &home.join(".local/share/fnm/node-versions"),
+        &["installation", "bin"],
+        push,
+    );
+    push(home.join(".local/share/fnm/aliases/default/bin"));
+    append_nested_bin_dirs(&home.join(".local/state/fnm_multishells"), &["bin"], push);
+    append_nested_bin_dirs(&home.join(".nvm/versions/node"), &["bin"], push);
+    push(home.join(".volta/bin"));
+    push(home.join(".local/share/mise/shims"));
+    push(home.join(".asdf/shims"));
+}
+
+fn append_nested_bin_dirs(base: &Path, suffix: &[&str], push: &mut impl FnMut(PathBuf)) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let mut path = entry.path();
+        for part in suffix {
+            path = path.join(part);
+        }
+        push(path);
+    }
+}
+
+#[cfg(unix)]
+fn find_binary_via_login_shell(name: &str) -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", &format!("command -v -- {name}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let candidate = PathBuf::from(&path);
+    if candidate.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn find_binary_via_login_shell(_name: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_login_shell_path_dirs() -> Vec<PathBuf> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = match std::process::Command::new(&shell)
+        .args(["-l", "-c", "printf %s \"$PATH\""])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    let path = String::from_utf8_lossy(&output.stdout).into_owned();
+    std::env::split_paths(&path).collect()
+}
+
 fn find_binary(names: &[&str]) -> Option<String> {
+    let paths = executable_search_path();
     for name in names {
-        if let Ok(path) = which::which(name) {
+        if let Ok(path) = which::which_in(name, Some(paths), ".") {
             return Some(path.to_string_lossy().to_string());
+        }
+        if let Some(path) = find_binary_via_login_shell(name) {
+            return Some(path);
         }
     }
     None
@@ -1243,5 +1405,39 @@ base_url = "http://old.example/codex"
     fn claude_only_uses_env_block_fields() {
         assert_eq!(CLAUDE_TARGETS[0].fields.len(), 1);
         assert_eq!(CLAUDE_TARGETS[0].fields[0].path, "env.ANTHROPIC_BASE_URL");
+    }
+
+    #[test]
+    fn executable_search_dirs_include_common_locations() {
+        let dirs = collect_executable_search_dirs();
+        assert!(dirs.iter().any(|dir| dir.ends_with("homebrew/bin")));
+        assert!(dirs.iter().any(|dir| dir.ends_with(".local/bin")));
+    }
+
+    #[test]
+    fn append_nested_bin_dirs_collects_fnm_node_versions() {
+        let base = std::env::temp_dir().join(format!("zwitch-fnm-test-{}", std::process::id()));
+        let bin_dir = base.join("v22.0.0/installation/bin");
+        fs::create_dir_all(&bin_dir).expect("create fnm test dir");
+        let mut dirs = Vec::new();
+        let mut push = |dir: PathBuf| dirs.push(dir);
+        append_nested_bin_dirs(&base, &["installation", "bin"], &mut push);
+        assert!(dirs.iter().any(|dir| dir == &bin_dir));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn find_binary_resolves_known_cli_tools() {
+        if find_binary(&["codex"]).is_none()
+            && find_binary(&["claude"]).is_none()
+            && find_binary(&["gemini"]).is_none()
+        {
+            return;
+        }
+        assert!(
+            find_binary(&["codex"]).is_some()
+                || find_binary(&["claude"]).is_some()
+                || find_binary(&["gemini"]).is_some()
+        );
     }
 }

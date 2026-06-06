@@ -1,6 +1,5 @@
 import { AppIcon } from "@/components/ui/app-icon";
 import { Button } from "@/components/ui/button";
-import { isDev } from "@/config/env";
 import { cn } from "@/lib/utils";
 import type { AuthState, NavItem } from "@/types";
 import { Compass, Info, LogOut, Plug, Rocket, Sparkles } from "lucide-react";
@@ -95,13 +94,13 @@ export function Sidebar({
               {auth.department ?? auth.title ?? "—"}
             </p>
           </div>
-          {isDev && onLogout ? (
+          {onLogout ? (
             <Button
               type="button"
               variant="ghost"
               size="icon"
               className="shrink-0 text-muted-foreground hover:text-foreground"
-              title="退出登录（开发）"
+              title="退出登录"
               onClick={onLogout}
             >
               <LogOut className="h-4 w-4" />

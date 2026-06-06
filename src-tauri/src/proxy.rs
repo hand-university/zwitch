@@ -1,6 +1,6 @@
-use crate::config::{AppConfig, DEVICE_FINGERPRINT_HEADER, LOCAL_PROXY_HOST};
+use crate::config::{DEVICE_FINGERPRINT_HEADER, LOCAL_PROXY_HOST};
 use crate::store::{load_auth, save_auth};
-use crate::user_api::{exchange_device_code, normalize_api_base_url};
+use crate::user_api::exchange_device_code;
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -160,11 +160,17 @@ impl CredentialManager {
 
         let resp = exchange_device_code(&code, &self.fingerprint, &base)
             .await
-            .map_err(|e| e.message())?;
+            .map_err(|e| {
+                if matches!(e, crate::user_api::ApiError::AuthCodeRejected) {
+                    let _ = crate::auth::force_logout(&self.app, &e.message());
+                }
+                e.message()
+            })?;
 
-        if let Some(new_base) = resp.base_url.as_deref().and_then(normalize_api_base_url) {
+        if resp.base_url.is_some() {
             let mut updated = auth;
-            updated.api_base_url = Some(new_base);
+            updated.api_base_url =
+                Some(crate::user_api::resolve_api_base_url(resp.base_url.as_deref()));
             let _ = save_auth(&self.app, &updated);
         }
 
@@ -182,10 +188,7 @@ impl CredentialManager {
 }
 
 fn resolve_api_base_url(auth: &crate::store::StoredAuth) -> String {
-    auth.api_base_url
-        .as_deref()
-        .and_then(normalize_api_base_url)
-        .unwrap_or_else(|| AppConfig::default().api_base_url)
+    crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref())
 }
 
 /// 按 CLI 工具映射到 Bifrost 网关的 integration 前缀，避免 Codex/Claude/Gemini 走错路由。
