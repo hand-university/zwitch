@@ -3,17 +3,17 @@ use serde::{Deserialize, Serialize};
 /// Dev 登录页
 pub const LOGIN_BASE_URL: &str = "http://localhost:8080";
 /// 线上登录页
-pub const LOGIN_BASE_URL_PROD: &str = "https://ft-wxhand.com/zai";
+pub const LOGIN_BASE_URL_PROD: &str = "https://ft-app.wxhand.com/zai";
 
 /// Dev API
 pub const API_BASE_URL: &str = "http://localhost:8080";
 /// 线上 API
-pub const API_BASE_URL_PROD: &str = "https://ft-wxhand.com/zai";
+pub const API_BASE_URL_PROD: &str = "https://ft-app.wxhand.com/zai";
 
 /// Dev 上游代理地址（本地拦截服务最终转发的目标）
 pub const PROXY_BASE_URL: &str = "http://localhost:8080/v1";
 /// 线上上游代理地址
-pub const PROXY_BASE_URL_PROD: &str = "https://ft-wxhand.com/zai/v1";
+pub const PROXY_BASE_URL_PROD: &str = "https://ft-app.wxhand.com/zai/v1";
 
 /// 本地拦截服务监听地址。各 AI CLI 的 base_url 会被指向
 /// `http://{LOCAL_PROXY_HOST}:{动态端口}/{tool_id}`。
