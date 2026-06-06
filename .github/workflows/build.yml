@@ -217,7 +217,10 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: ZWitch ${{ github.ref_name }}
-          releaseBody: Desktop builds for Linux x64, macOS arm64/x64, and Windows x64.
+          releaseBody: |
+            Desktop builds for Linux x64, macOS arm64/x64, and Windows x64.
+          generateReleaseNotes: true
+          includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
           args: --config '{"build":{"beforeBuildCommand":""}}' ${{ matrix.args }}

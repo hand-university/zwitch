@@ -1,5 +1,4 @@
-use crate::config::{AppConfig, UPDATE_API_PATH};
-use crate::store;
+use crate::config::UPDATE_ENDPOINT_PROD;
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
@@ -26,25 +25,8 @@ pub struct UpdateCheckResult {
     pub date: Option<String>,
 }
 
-fn resolve_api_base_url(app: &AppHandle) -> String {
-    store::load_auth(app)
-        .ok()
-        .and_then(|auth| {
-            auth.api_base_url
-                .as_deref()
-                .and_then(crate::user_api::normalize_api_base_url)
-        })
-        .unwrap_or_else(|| AppConfig::default().api_base_url)
-}
-
-fn resolve_update_endpoint(app: &AppHandle) -> Result<Url, String> {
-    let api_base = resolve_api_base_url(app);
-    let endpoint = format!(
-        "{}{}",
-        api_base.trim_end_matches('/'),
-        UPDATE_API_PATH
-    );
-    Url::parse(&endpoint).map_err(|e| format!("无效的更新地址: {e}"))
+fn resolve_update_endpoint() -> Result<Url, String> {
+    Url::parse(UPDATE_ENDPOINT_PROD).map_err(|e| format!("无效的更新地址: {e}"))
 }
 
 pub fn get_app_info(app: AppHandle) -> Result<AppInfo, String> {
@@ -61,7 +43,7 @@ pub async fn check_for_update(
     pending: State<'_, PendingUpdate>,
 ) -> Result<UpdateCheckResult, String> {
     let current_version = app.package_info().version.to_string();
-    let endpoint = resolve_update_endpoint(&app)?;
+    let endpoint = resolve_update_endpoint()?;
 
     let update = app
         .updater_builder()

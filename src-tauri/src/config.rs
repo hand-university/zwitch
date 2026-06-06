@@ -48,9 +48,10 @@ pub const DEVICE_AUTHORIZE_PATH: &str = "/api/aone/devices/authorize";
 pub const DEVICE_TOKEN_PATH: &str = "/api/aone/devices/token";
 pub const DEVICE_REVOKE_PATH: &str = "/api/aone/devices/revoke";
 
-/// 应用更新检查路径（Tauri updater 占位符：target / arch / current_version）
-pub const UPDATE_API_PATH: &str =
-    "/api/aone/zwitch/updates/{{target}}/{{arch}}/{{current_version}}";
+/// GitHub 仓库 hand-university/zwitch（Actions 发版后由 tauri-action 上传 latest.json）
+/// Tauri updater 静态清单，指向 GitHub Releases 最新版
+pub const UPDATE_ENDPOINT_PROD: &str =
+    "https://github.com/hand-university/zwitch/releases/latest/download/latest.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
