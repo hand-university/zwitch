@@ -217,6 +217,72 @@ fn gemini_model_from_path(path: &str) -> Option<String> {
     }
 }
 
+/// 判断上游响应是否表示请求成功（仅 HTTP 2xx 不够：流式接口常在错误时仍返回 200）。
+pub fn is_successful_response(provider: Provider, body: &[u8], streaming: bool) -> bool {
+    if streaming {
+        is_successful_streaming(body)
+    } else {
+        is_successful_non_streaming(provider, body)
+    }
+}
+
+fn is_successful_non_streaming(provider: Provider, body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    if value.get("error").is_some() {
+        return false;
+    }
+    match provider {
+        Provider::OpenAI => is_successful_openai_non_streaming(&value),
+        Provider::Anthropic => value.get("type").and_then(|t| t.as_str()) == Some("message"),
+        Provider::Gemini => value.get("error").is_none() && value.get("candidates").is_some(),
+    }
+}
+
+fn is_successful_openai_non_streaming(value: &serde_json::Value) -> bool {
+    if let Some(status) = value.get("status").and_then(|s| s.as_str()) {
+        if status == "failed" || status == "incomplete" {
+            return false;
+        }
+    }
+    value.get("choices").is_some()
+        || value.get("output").is_some()
+        || value.get("status").and_then(|s| s.as_str()) == Some("completed")
+}
+
+fn is_successful_streaming(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body);
+    for line in text.lines() {
+        if line.trim() == "event: error" {
+            return false;
+        }
+    }
+    for payload in iter_json_payloads(&text) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if value.get("error").is_some() {
+            return false;
+        }
+        if let Some(kind) = value.get("type").and_then(|t| t.as_str()) {
+            if kind == "error" || kind == "response.failed" {
+                return false;
+            }
+        }
+        if let Some(status) = value
+            .get("response")
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str())
+        {
+            if status == "failed" || status == "incomplete" {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// 解析非流式响应体中的 token 用量。
 pub fn parse_usage(provider: Provider, body: &[u8]) -> Option<TokenUsage> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -457,5 +523,62 @@ mod tests {
             cache_read_tokens: 0,
         };
         assert_eq!(cost_for("mystery-model", &usage), 0.0);
+    }
+
+    #[test]
+    fn openai_error_with_usage_is_not_successful() {
+        let body = br#"{"error":{"message":"rate limit"},"usage":{"input_tokens":10,"output_tokens":0}}"#;
+        assert!(!is_successful_response(Provider::OpenAI, body, false));
+    }
+
+    #[test]
+    fn openai_completed_response_is_successful() {
+        let body = br#"{"id":"resp_1","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5}}"#;
+        assert!(is_successful_response(Provider::OpenAI, body, false));
+    }
+
+    #[test]
+    fn anthropic_error_type_is_not_successful() {
+        let body = br#"{"type":"error","error":{"type":"overloaded_error"},"usage":{"input_tokens":100,"output_tokens":0}}"#;
+        assert!(!is_successful_response(Provider::Anthropic, body, false));
+    }
+
+    #[test]
+    fn anthropic_message_is_successful() {
+        let body = br#"{"type":"message","usage":{"input_tokens":100,"output_tokens":20}}"#;
+        assert!(is_successful_response(Provider::Anthropic, body, false));
+    }
+
+    #[test]
+    fn streaming_error_event_is_not_successful() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":200,\"output_tokens\":1}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+        );
+        assert!(!is_successful_response(Provider::Anthropic, body.as_bytes(), true));
+    }
+
+    #[test]
+    fn streaming_openai_failed_is_not_successful() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}\n\n",
+        );
+        assert!(!is_successful_response(Provider::OpenAI, body.as_bytes(), true));
+    }
+
+    #[test]
+    fn successful_streaming_anthropic_is_recordable() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":200,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        assert!(is_successful_response(Provider::Anthropic, body.as_bytes(), true));
     }
 }

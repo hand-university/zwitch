@@ -530,12 +530,18 @@ impl UsageContext {
     }
 
     fn record_non_streaming(self, body: &[u8]) {
+        if !usage::is_successful_response(self.provider, body, false) {
+            return;
+        }
         if let Some(usage) = usage::parse_usage(self.provider, body) {
             self.record(usage);
         }
     }
 
     fn record_streaming(self, body: &[u8]) {
+        if !usage::is_successful_response(self.provider, body, true) {
+            return;
+        }
         if let Some(usage) = usage::parse_streaming_usage(self.provider, body) {
             self.record(usage);
         }
@@ -625,6 +631,8 @@ where
                 Some((item, state))
             }
             Some(Err(e)) => {
+                // 流传输中断视为失败，丢弃已缓冲的用量。
+                state.usage_ctx = None;
                 let item: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> =
                     Err(Box::new(e));
                 Some((item, state))
