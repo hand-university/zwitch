@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Download, Info, Loader2, RefreshCw } from "lucide-react";
+import { Download, Loader2, RefreshCw } from "lucide-react";
 import { AppIcon } from "@/components/ui/app-icon";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -59,7 +59,7 @@ export function AboutPage({ busy }: AboutPageProps) {
 
   return (
     <div className="p-6">
-      <div className="mx-auto max-w-3xl space-y-4">
+      <div className="mx-auto max-w-3xl">
         <Card className="overflow-hidden">
           <div className="flex items-center gap-4 border-b border-border px-6 py-5">
             <AppIcon size="md" className="shadow-sm" />
@@ -73,98 +73,55 @@ export function AboutPage({ busy }: AboutPageProps) {
             </div>
           </div>
 
-          <div className="divide-y divide-border px-6">
-            <InfoRow label="版本" value={appInfo ? `v${appInfo.version}` : "—"} />
-            <InfoRow label="标识符" value={appInfo?.identifier ?? "—"} mono />
-            <InfoRow
-              label="运行环境"
-              value={isDev ? "开发模式" : "正式版"}
-            />
-          </div>
-        </Card>
-
-        {!isDev ? (
-        <Card className="p-6">
-          <div className="flex items-start gap-4">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-muted text-muted-foreground">
-              <Info className="h-5 w-5" />
-            </div>
-            <div className="min-w-0 flex-1 space-y-3">
-              <h4 className="text-sm font-medium">检查更新</h4>
-
-              {updateStatus === "up-to-date" ? (
-                <p className="text-sm text-emerald-600 dark:text-emerald-400">
-                  当前 v{updateInfo?.currentVersion ?? appInfo?.version} 已是最新版本
-                </p>
-              ) : null}
-
-              {updateStatus === "available" && updateInfo?.version ? (
-                <div className="rounded-lg border border-border/60 bg-muted/30 p-3 text-sm">
-                  <p className="font-medium">新版本 v{updateInfo.version} 可用</p>
-                  {updateInfo.notes ? (
-                    <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
-                      {updateInfo.notes}
-                    </p>
-                  ) : null}
-                </div>
-              ) : null}
-
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCheckUpdate}
-                  disabled={busy || checking || installing}
-                >
-                  {checking ? (
-                    <Loader2 className="animate-spin" />
-                  ) : (
-                    <RefreshCw />
-                  )}
-                  检查更新
-                </Button>
-
-                {updateStatus === "available" ? (
-                  <Button
-                    size="sm"
-                    onClick={handleInstallUpdate}
-                    disabled={busy || installing}
-                  >
-                    {installing ? (
-                      <Loader2 className="animate-spin" />
-                    ) : (
-                      <Download />
-                    )}
-                    {installing ? "正在安装..." : "下载并安装"}
-                  </Button>
+          <div className="px-6 py-3.5">
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sm text-muted-foreground">版本</span>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <span className="text-sm font-medium">
+                  {appInfo ? `v${appInfo.version}` : "—"}
+                </span>
+                {!isDev ? (
+                  <>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleCheckUpdate}
+                      disabled={busy || checking || installing}
+                    >
+                      {checking ? (
+                        <Loader2 className="animate-spin" />
+                      ) : (
+                        <RefreshCw />
+                      )}
+                      检查更新
+                    </Button>
+                    {updateStatus === "available" ? (
+                      <Button
+                        size="sm"
+                        onClick={handleInstallUpdate}
+                        disabled={busy || installing}
+                      >
+                        {installing ? (
+                          <Loader2 className="animate-spin" />
+                        ) : (
+                          <Download />
+                        )}
+                        {installing ? "正在安装..." : "下载并安装"}
+                      </Button>
+                    ) : null}
+                  </>
                 ) : null}
               </div>
             </div>
+
+            {updateStatus === "available" && updateInfo?.version ? (
+              <p className="mt-2 text-right text-xs text-muted-foreground">
+                新版本 v{updateInfo.version} 可用
+              </p>
+            ) : null}
           </div>
         </Card>
-        ) : null}
       </div>
-    </div>
-  );
-}
-
-function InfoRow({
-  label,
-  value,
-  mono = false,
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-4 py-3.5">
-      <span className="text-sm text-muted-foreground">{label}</span>
-      <span
-        className={`text-sm font-medium ${mono ? "font-mono text-xs" : ""}`}
-      >
-        {value}
-      </span>
     </div>
   );
 }

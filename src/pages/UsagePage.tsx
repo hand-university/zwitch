@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { message } from "@/components/ui/message";
 import { clearUsage, getUsageSummary } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import type { DailyUsage, UsageSummary, UsageTotals } from "@/types";
 
 interface UsagePageProps {
@@ -21,6 +22,24 @@ interface UsagePageProps {
 }
 
 const CALENDAR_WEEKS = 27;
+const CALENDAR_CELL = 10;
+const CALENDAR_GAP = 3;
+
+/** GitHub 亮色主题色阶：无活动浅灰 → 用量越多绿色越深 */
+const CALENDAR_COLORS = [
+  "#ebedf0",
+  "#9be9a8",
+  "#40c463",
+  "#30a14e",
+  "#216e39",
+] as const;
+
+
+const WEEKDAY_LABELS: Record<number, string> = {
+  1: "一",
+  3: "三",
+  5: "五",
+};
 
 function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`;
@@ -43,6 +62,21 @@ function toDateKey(date: Date): string {
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+function parseLocalDate(dateStr: string): Date {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function addDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function localTodayKey(): string {
+  return toDateKey(new Date());
 }
 
 export function UsagePage({ busy, onError }: UsagePageProps) {
@@ -112,7 +146,7 @@ export function UsagePage({ busy, onError }: UsagePageProps) {
 
         {!hasData ? (
           <Card className="p-10 text-center text-sm text-muted-foreground">
-            暂无用量数据。开启代理并通过 Codex / Claude Code / Gemini CLI 发起请求后，
+            暂无用量数据。开启代理并通过 Codex / Claude Code 发起请求后，
             这里会记录 token 用量与费用。
           </Card>
         ) : (
@@ -217,13 +251,62 @@ function TokenBreakdown({ total }: { total: UsageTotals }) {
   );
 }
 
-function intensityClass(tokens: number, max: number): string {
-  if (tokens <= 0) return "bg-muted/60";
-  const ratio = tokens / (max || 1);
-  if (ratio > 0.66) return "bg-emerald-600";
-  if (ratio > 0.33) return "bg-emerald-500/80";
-  if (ratio > 0.1) return "bg-emerald-400/70";
-  return "bg-emerald-300/60";
+type ContributionLevel = 0 | 1 | 2 | 3 | 4;
+
+function dayTokens(day: DailyUsage): number {
+  return (
+    day.input_tokens +
+    day.output_tokens +
+    day.cache_creation_tokens +
+    day.cache_read_tokens
+  );
+}
+
+/** 按绝对 token 数分档（对数尺度），无活动浅灰，用量越多绿色越深 */
+function contributionLevel(tokens: number): ContributionLevel {
+  if (tokens <= 0) return 0;
+  const log = Math.log10(tokens);
+  if (log < 3) return 1;
+  if (log < 4) return 2;
+  if (log < 5) return 3;
+  return 4;
+}
+
+function CalendarDayCell({
+  level,
+  isToday,
+  title,
+  future,
+}: {
+  level: ContributionLevel;
+  isToday: boolean;
+  title: string;
+  future: boolean;
+}) {
+  if (future) {
+    return (
+      <div
+        style={{ width: CALENDAR_CELL, height: CALENDAR_CELL }}
+        className="shrink-0 rounded-[2px]"
+      />
+    );
+  }
+
+  return (
+    <div
+      title={title}
+      style={{
+        width: CALENDAR_CELL,
+        height: CALENDAR_CELL,
+        backgroundColor: CALENDAR_COLORS[level],
+      }}
+      className={cn(
+        "shrink-0 rounded-[2px]",
+        isToday &&
+          "outline outline-1 outline-[rgba(27,31,36,0.15)] outline-offset-[-1px]",
+      )}
+    />
+  );
 }
 
 function ActiveCalendar({ summary }: { summary: UsageSummary }) {
@@ -233,104 +316,121 @@ function ActiveCalendar({ summary }: { summary: UsageSummary }) {
     return map;
   }, [summary.calendar]);
 
-  const { weeks, maxTokens, monthLabels } = useMemo(() => {
-    const today = new Date(`${summary.today}T00:00:00`);
+  const { weeks, monthLabels, todayKey } = useMemo(() => {
+    const todayKey = summary.today || localTodayKey();
+    const today = parseLocalDate(todayKey);
     const todayDow = today.getDay();
-    const end = new Date(today);
-    end.setDate(end.getDate() + (6 - todayDow));
-
-    const totalDays = CALENDAR_WEEKS * 7;
-    const start = new Date(end);
-    start.setDate(start.getDate() - (totalDays - 1));
+    const gridStart = addDays(today, -todayDow - (CALENDAR_WEEKS - 1) * 7);
 
     const weeks: { key: string; tokens: number; day: DailyUsage | undefined; future: boolean }[][] =
       [];
     const monthLabels: { col: number; label: string }[] = [];
-    let maxTokens = 0;
-    let lastMonth = -1;
+    const labeledMonths = new Set<number>();
 
-    const cursor = new Date(start);
     for (let w = 0; w < CALENDAR_WEEKS; w += 1) {
       const week: typeof weeks[number] = [];
-      for (let d = 0; d < 7; d += 1) {
-        const key = toDateKey(cursor);
+      for (let dow = 0; dow < 7; dow += 1) {
+        const date = addDays(gridStart, w * 7 + dow);
+        const key = toDateKey(date);
         const day = byDate.get(key);
-        const tokens = day
-          ? day.input_tokens +
-            day.output_tokens +
-            day.cache_creation_tokens +
-            day.cache_read_tokens
-          : 0;
-        maxTokens = Math.max(maxTokens, tokens);
-        const future = cursor > today;
+        const tokens = day ? dayTokens(day) : 0;
+        const future = date > today;
         week.push({ key, tokens, day, future });
 
-        if (d === 0) {
-          const month = cursor.getMonth();
-          if (month !== lastMonth) {
+        if (date.getDate() === 1) {
+          const month = date.getMonth();
+          if (!labeledMonths.has(month)) {
+            labeledMonths.add(month);
             monthLabels.push({
               col: w,
               label: `${month + 1}月`,
             });
-            lastMonth = month;
           }
         }
-        cursor.setDate(cursor.getDate() + 1);
       }
       weeks.push(week);
     }
-    return { weeks, maxTokens, monthLabels };
+    return { weeks, monthLabels, todayKey };
   }, [byDate, summary.today]);
 
   return (
     <Card className="p-5">
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex items-center justify-between gap-4">
         <h3 className="text-sm font-medium">活跃日历</h3>
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <div className="flex items-center gap-1 text-xs text-muted-foreground">
           <span>少</span>
-          <span className="h-3 w-3 rounded-sm bg-muted/60" />
-          <span className="h-3 w-3 rounded-sm bg-emerald-300/60" />
-          <span className="h-3 w-3 rounded-sm bg-emerald-400/70" />
-          <span className="h-3 w-3 rounded-sm bg-emerald-500/80" />
-          <span className="h-3 w-3 rounded-sm bg-emerald-600" />
+          {CALENDAR_COLORS.map((color) => (
+            <span
+              key={color}
+              style={{
+                width: CALENDAR_CELL,
+                height: CALENDAR_CELL,
+                backgroundColor: color,
+              }}
+              className="inline-block shrink-0 rounded-[2px]"
+            />
+          ))}
           <span>多</span>
         </div>
       </div>
 
       <div className="overflow-x-auto">
-        <div className="inline-flex flex-col gap-1">
-          <div className="flex gap-1 pl-0">
-            {weeks.map((_, col) => {
-              const label = monthLabels.find((m) => m.col === col);
-              return (
-                <div key={col} className="w-3 text-[10px] text-muted-foreground">
-                  {label ? label.label : ""}
-                </div>
-              );
-            })}
-          </div>
-          <div className="flex gap-1">
-            {weeks.map((week, col) => (
-              <div key={col} className="flex flex-col gap-1">
-                {week.map((cell) => {
-                  if (cell.future) {
-                    return <div key={cell.key} className="h-3 w-3" />;
-                  }
-                  const title = cell.day
-                    ? `${cell.key}：${formatFullNumber(cell.tokens)} tokens · ${formatCost(cell.day.cost_usd)} · ${cell.day.requests} 次`
-                    : `${cell.key}：无活动`;
-                  return (
-                    <div
-                      key={cell.key}
-                      title={title}
-                      className={`h-3 w-3 rounded-sm ${intensityClass(cell.tokens, maxTokens)} ${
-                        cell.key === summary.today ? "ring-1 ring-primary ring-offset-1 ring-offset-background" : ""
-                      }`}
-                    />
-                  );
-                })}
+        <div className="inline-flex" style={{ gap: CALENDAR_GAP }}>
+          <div
+            className="flex shrink-0 flex-col text-[10px] leading-none text-muted-foreground"
+            style={{ gap: CALENDAR_GAP, paddingTop: 15 }}
+          >
+            {Array.from({ length: 7 }, (_, dow) => (
+              <div
+                key={dow}
+                className="flex items-center justify-end pr-1"
+                style={{ height: CALENDAR_CELL }}
+              >
+                {WEEKDAY_LABELS[dow] ?? ""}
               </div>
             ))}
+          </div>
+
+          <div className="flex flex-col" style={{ gap: CALENDAR_GAP }}>
+            <div className="flex" style={{ gap: CALENDAR_GAP, height: 15 }}>
+              {weeks.map((_, col) => {
+                const label = monthLabels.find((m) => m.col === col);
+                return (
+                  <div
+                    key={col}
+                    style={{ width: CALENDAR_CELL }}
+                    className="relative overflow-visible"
+                  >
+                    {label ? (
+                      <span className="absolute left-0 top-0 whitespace-nowrap text-[10px] text-muted-foreground">
+                        {label.label}
+                      </span>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="flex" style={{ gap: CALENDAR_GAP }}>
+              {weeks.map((week, col) => (
+                <div key={col} className="flex flex-col" style={{ gap: CALENDAR_GAP }}>
+                  {week.map((cell) => {
+                    const title = cell.day
+                      ? `${cell.key}：${formatFullNumber(cell.tokens)} tokens · ${formatCost(cell.day.cost_usd)} · ${cell.day.requests} 次`
+                      : `${cell.key}：无活动`;
+                    return (
+                      <CalendarDayCell
+                        key={cell.key}
+                        level={contributionLevel(cell.tokens)}
+                        isToday={cell.key === todayKey}
+                        title={title}
+                        future={cell.future}
+                      />
+                    );
+                  })}
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       </div>
