@@ -1,5 +1,8 @@
+use crate::usage::TokenUsage;
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use tauri::AppHandle;
 use tauri_plugin_store::StoreExt;
 
@@ -11,7 +14,11 @@ const STORE_KEYS: &[&str] = &[
     "config_backup",
     "marketplace_registry",
     "device",
+    "usage",
 ];
+
+/// 序列化用量写入：避免并发请求的 read-modify-write 互相覆盖。
+static USAGE_LOCK: Mutex<()> = Mutex::new(());
 
 type AppStore = std::sync::Arc<tauri_plugin_store::Store<tauri::Wry>>;
 
@@ -191,4 +198,124 @@ pub fn save_marketplace_registry(
         serde_json::to_value(registry).map_err(|e| e.to_string())?,
     );
     store.save().map_err(|e| e.to_string())
+}
+
+/// 一类聚合实体（某天 / 某模型 / 全局）累计的 token、费用与请求次数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub requests: u64,
+}
+
+impl UsageTotals {
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
+    }
+
+    fn add(&mut self, usage: &TokenUsage, cost_usd: f64) {
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cache_creation_tokens += usage.cache_creation_tokens;
+        self.cache_read_tokens += usage.cache_read_tokens;
+        self.cost_usd += cost_usd;
+        self.requests += 1;
+    }
+}
+
+/// 某一天的用量：总计 + 按模型拆分。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DailyUsage {
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+    #[serde(default)]
+    pub models: HashMap<String, UsageTotals>,
+}
+
+/// 用量持久化根：按本地日期（YYYY-MM-DD）聚合，并维护全局与按模型总计。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageStore {
+    #[serde(default)]
+    pub days: HashMap<String, DailyUsage>,
+    #[serde(default)]
+    pub models: HashMap<String, UsageTotals>,
+    #[serde(default)]
+    pub total: UsageTotals,
+    #[serde(default)]
+    pub first_recorded_at: Option<String>,
+    #[serde(default)]
+    pub last_recorded_at: Option<String>,
+}
+
+pub fn load_usage(app: &AppHandle) -> Result<UsageStore, String> {
+    let store = get_store(app)?;
+    Ok(store
+        .get("usage")
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default())
+}
+
+fn save_usage(app: &AppHandle, usage: &UsageStore) -> Result<(), String> {
+    let store = get_store(app)?;
+    store.set(
+        "usage",
+        serde_json::to_value(usage).map_err(|e| e.to_string())?,
+    );
+    store.save().map_err(|e| e.to_string())
+}
+
+/// 记录一次请求的用量：按当天日期与模型聚合并累加费用。
+pub fn record_usage(
+    app: &AppHandle,
+    model: &str,
+    usage: &TokenUsage,
+    cost_usd: f64,
+) -> Result<(), String> {
+    if usage.is_empty() {
+        return Ok(());
+    }
+    let _guard = USAGE_LOCK.lock().map_err(|_| "用量锁中毒".to_string())?;
+
+    let now = Local::now();
+    let date = now.format("%Y-%m-%d").to_string();
+    let timestamp = now.to_rfc3339();
+    let model_key = if model.is_empty() { "unknown" } else { model };
+
+    let mut store = load_usage(app)?;
+
+    store.total.add(usage, cost_usd);
+    store
+        .models
+        .entry(model_key.to_string())
+        .or_default()
+        .add(usage, cost_usd);
+
+    let day = store.days.entry(date).or_default();
+    day.totals.add(usage, cost_usd);
+    day.models
+        .entry(model_key.to_string())
+        .or_default()
+        .add(usage, cost_usd);
+
+    if store.first_recorded_at.is_none() {
+        store.first_recorded_at = Some(timestamp.clone());
+    }
+    store.last_recorded_at = Some(timestamp);
+
+    save_usage(app, &store)
+}
+
+/// 清空全部用量统计。
+pub fn clear_usage(app: &AppHandle) -> Result<(), String> {
+    let _guard = USAGE_LOCK.lock().map_err(|_| "用量锁中毒".to_string())?;
+    save_usage(app, &UsageStore::default())
 }

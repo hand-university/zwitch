@@ -8,6 +8,7 @@ import type {
   MarketplaceItem,
   MarketplaceSyncResult,
   UpdateCheckResult,
+  UsageSummary,
 } from "@/types";
 
 export async function getAuthState(): Promise<AuthState> {
@@ -110,4 +111,12 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
 
 export async function installAvailableUpdate(): Promise<void> {
   return invoke("install_available_update");
+}
+
+export async function getUsageSummary(): Promise<UsageSummary> {
+  return invoke("get_usage_summary");
+}
+
+export async function clearUsage(): Promise<void> {
+  return invoke("clear_usage");
 }

@@ -8,6 +8,8 @@ mod marketplace;
 mod proxy;
 mod store;
 mod updater;
+mod usage;
+mod usage_api;
 mod user_api;
 
 use std::sync::Mutex;
@@ -135,6 +137,16 @@ async fn install_available_update(
     updater::install_available_update(app, pending).await
 }
 
+#[tauri::command]
+fn get_usage_summary(app: tauri::AppHandle) -> Result<usage_api::UsageSummary, String> {
+    usage_api::get_usage_summary(&app)
+}
+
+#[tauri::command]
+fn clear_usage(app: tauri::AppHandle) -> Result<(), String> {
+    usage_api::clear_usage(&app)
+}
+
 #[cfg(desktop)]
 use tauri::{Manager, RunEvent, WindowEvent};
 
@@ -187,6 +199,8 @@ pub fn run() {
             get_app_info,
             check_for_update,
             install_available_update,
+            get_usage_summary,
+            clear_usage,
         ])
         .setup(|app| {
             macos_scheme::ensure_url_scheme_registered()?;

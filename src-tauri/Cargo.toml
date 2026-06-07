@@ -27,9 +27,11 @@ which = "7"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["clock"] }
 tokio = { version = "1", features = ["time", "net", "rt-multi-thread", "io-util"] }
 axum = "0.8"
 futures-util = "0.3"
+bytes = "1"
 toml = "0.8"
 tauri-plugin-process = "2"
 

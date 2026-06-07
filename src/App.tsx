@@ -27,6 +27,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { MarketplacePage } from "@/pages/MarketplacePage";
 import { AboutPage } from "@/pages/AboutPage";
 import { QuickStartPage } from "@/pages/QuickStartPage";
+import { UsagePage } from "@/pages/UsagePage";
 import { reportApiError } from "@/lib/auth";
 import type {
   AppPage,
@@ -42,6 +43,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: "explore", label: "探索" },
   { id: "skills", label: "技能" },
   { id: "plugins", label: "插件" },
+  { id: "usage", label: "用量" },
   { id: "about", label: "关于" },
 ];
 
@@ -61,6 +63,10 @@ const PAGE_META: Record<AppPage, { title: string; description: string }> = {
   plugins: {
     title: "插件",
     description: "管理已安装的插件",
+  },
+  usage: {
+    title: "用量",
+    description: "查看 token 用量、消耗金额与活跃日历",
   },
   about: {
     title: "关于",
@@ -390,6 +396,9 @@ export default function App() {
               onToggle={handleMarketplaceToggle}
               onDelete={handleMarketplaceDelete}
             />
+          ) : null}
+          {activePage === "usage" ? (
+            <UsagePage busy={busy} onError={handleApiError} />
           ) : null}
           {activePage === "about" ? <AboutPage busy={busy} /> : null}
         </div>
