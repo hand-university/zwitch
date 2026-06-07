@@ -20,4 +20,6 @@ commands.allow = [
   "get_app_info",
   "check_for_update",
   "install_available_update",
+  "get_usage_summary",
+  "clear_usage",
 ]

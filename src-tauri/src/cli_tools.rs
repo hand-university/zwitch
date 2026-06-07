@@ -115,16 +115,18 @@ const TOOLS: &[ToolDefinition] = &[
         install_url: "https://docs.anthropic.com/en/docs/claude-code",
         targets: CLAUDE_TARGETS,
     },
-    ToolDefinition {
-        id: "gemini",
-        name: "Gemini CLI",
-        binaries: &["gemini"],
-        base_url_field: "GOOGLE_GEMINI_BASE_URL",
-        token_field: "GEMINI_API_KEY",
-        install_url: "https://github.com/google-gemini/gemini-cli",
-        targets: GEMINI_TARGETS,
-    },
 ];
+
+/// 暂时禁用的工具：不参与检测/注入，但会尝试还原已注入的配置。
+const DISABLED_TOOLS: &[ToolDefinition] = &[ToolDefinition {
+    id: "gemini",
+    name: "Gemini CLI",
+    binaries: &["gemini"],
+    base_url_field: "GOOGLE_GEMINI_BASE_URL",
+    token_field: "GEMINI_API_KEY",
+    install_url: "https://github.com/google-gemini/gemini-cli",
+    targets: GEMINI_TARGETS,
+}];
 
 /// 暴露所有受支持工具的 id，供本地拦截服务建立上游路由映射。
 pub fn tool_ids() -> Vec<&'static str> {
@@ -213,6 +215,32 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
             }
 
             inject_values(target, &config_path, &local_base)?;
+        }
+    }
+
+    for tool in DISABLED_TOOLS {
+        for target in tool.targets {
+            let config_path = home.join(target.relative);
+            let Some(content) = read_config_if_exists(&config_path) else {
+                continue;
+            };
+            if !is_target_injected(tool, target, &content) {
+                continue;
+            }
+            if restore_config(app, &mut backup, tool, target, &config_path)? {
+                backup_dirty = true;
+            } else if matches!(target.format, ConfigFormat::DotEnv) {
+                let mut content = fs::read_to_string(&config_path)
+                    .map_err(|e| format!("读取配置失败: {e}"))?;
+                for field in target.fields {
+                    if read_dotenv_value(&content, field.path)
+                        .is_some_and(|url| is_local_proxy_base_url(&url, tool.id))
+                    {
+                        content = remove_dotenv_key(&content, field.path)?;
+                    }
+                }
+                write_config(&config_path, &content)?;
+            }
         }
     }
 
@@ -1385,13 +1413,6 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
-    fn gemini_uses_env_file_not_settings_json() {
-        assert_eq!(GEMINI_TARGETS[0].relative, ".gemini/.env");
-        assert_eq!(GEMINI_TARGETS[0].fields[0].path, "GOOGLE_GEMINI_BASE_URL");
-        assert_eq!(GEMINI_TARGETS[0].fields.len(), 1);
-    }
-
-    #[test]
     fn detects_claude_local_proxy_injection() {
         let content = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:51805/claude"}}"#;
         assert!(is_target_injected(&TOOLS[1], &CLAUDE_TARGETS[0], content));
@@ -1428,16 +1449,11 @@ base_url = "http://old.example/codex"
 
     #[test]
     fn find_binary_resolves_known_cli_tools() {
-        if find_binary(&["codex"]).is_none()
-            && find_binary(&["claude"]).is_none()
-            && find_binary(&["gemini"]).is_none()
-        {
+        if find_binary(&["codex"]).is_none() && find_binary(&["claude"]).is_none() {
             return;
         }
         assert!(
-            find_binary(&["codex"]).is_some()
-                || find_binary(&["claude"]).is_some()
-                || find_binary(&["gemini"]).is_some()
+            find_binary(&["codex"]).is_some() || find_binary(&["claude"]).is_some()
         );
     }
 }

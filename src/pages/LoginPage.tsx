@@ -21,7 +21,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
           <AppIcon size="md" className="mx-auto mb-4 shadow-sm" />
           <CardTitle className="text-2xl">ZWitch</CardTitle>
           <CardDescription>
-            登录后即可自动配置 Codex、Claude Code、Gemini CLI 的代理地址和 Token
+            登录后即可自动配置 Codex、Claude Code 的代理地址和 Token
           </CardDescription>
         </CardHeader>
         <CardContent>

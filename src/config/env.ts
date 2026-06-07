@@ -22,7 +22,6 @@ export const DEEPLINK_CALLBACK_URL = `${DEEPLINK_SCHEME}://${DEEPLINK_HOST}`;
 export const CLI_INSTALL_LINKS = {
   codex: "https://developers.openai.com/codex/cli",
   claude: "https://docs.anthropic.com/en/docs/claude-code",
-  gemini: "https://github.com/google-gemini/gemini-cli",
 } as const;
 
 export type CliToolId = keyof typeof CLI_INSTALL_LINKS;
