@@ -19,7 +19,10 @@ commands.allow = [
   "scan_local_marketplace",
   "get_app_info",
   "check_for_update",
-  "install_available_update",
+  "get_downloaded_update_info",
+  "download_available_update",
+  "install_downloaded_update",
+  "defer_downloaded_update",
   "get_usage_summary",
   "clear_usage",
 ]

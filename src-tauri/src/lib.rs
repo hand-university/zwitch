@@ -13,15 +13,12 @@ mod usage;
 mod usage_api;
 mod user_api;
 
-use std::sync::Mutex;
-
-/// 后台定时刷新用户资料与临时凭证的间隔（秒）。
 const SESSION_REFRESH_INTERVAL_SECS: u64 = 600;
 
 use auth::AuthState;
 use cli_tools::CliToolStatus;
 use marketplace::{ExploreItemView, MarketplaceItemView, MarketplaceSyncResult};
-use updater::{AppInfo, PendingUpdate, UpdateCheckResult};
+use updater::{AppInfo, DownloadedUpdateInfo, UpdateCheckResult, UpdateState};
 
 #[tauri::command]
 fn get_auth_state(app: tauri::AppHandle) -> Result<AuthState, String> {
@@ -125,17 +122,41 @@ fn get_app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
 #[tauri::command]
 async fn check_for_update(
     app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingUpdate>,
+    state: tauri::State<'_, UpdateState>,
 ) -> Result<UpdateCheckResult, String> {
-    updater::check_for_update(app, pending).await
+    updater::check_for_update(app, state).await
 }
 
 #[tauri::command]
-async fn install_available_update(
+fn get_downloaded_update_info(
     app: tauri::AppHandle,
-    pending: tauri::State<'_, PendingUpdate>,
+    state: tauri::State<'_, UpdateState>,
+) -> Result<DownloadedUpdateInfo, String> {
+    updater::get_downloaded_update_info(app, state)
+}
+
+#[tauri::command]
+async fn download_available_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, UpdateState>,
 ) -> Result<(), String> {
-    updater::install_available_update(app, pending).await
+    updater::download_available_update(app, state).await
+}
+
+#[tauri::command]
+async fn install_downloaded_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, UpdateState>,
+) -> Result<(), String> {
+    updater::install_downloaded_update(app, state).await
+}
+
+#[tauri::command]
+async fn defer_downloaded_update(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, UpdateState>,
+) -> Result<(), String> {
+    updater::defer_downloaded_update(app, state).await
 }
 
 #[tauri::command]
@@ -167,7 +188,7 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(PendingUpdate(Mutex::new(None)));
+        .manage(UpdateState::new());
 
     #[cfg(desktop)]
     {
@@ -199,12 +220,19 @@ pub fn run() {
             scan_local_marketplace,
             get_app_info,
             check_for_update,
-            install_available_update,
+            get_downloaded_update_info,
+            download_available_update,
+            install_downloaded_update,
+            defer_downloaded_update,
             get_usage_summary,
             clear_usage,
         ])
         .setup(|app| {
             macos_scheme::ensure_url_scheme_registered()?;
+            let startup_handle = app.handle().clone();
+            tauri::async_runtime::block_on(async move {
+                updater::try_install_deferred_update(&startup_handle).await;
+            });
             if let Ok(mut auth) = store::load_auth(app.handle()) {
                 let effective =
                     user_api::resolve_api_base_url(auth.api_base_url.as_deref());

@@ -63,6 +63,17 @@ export interface UpdateCheckResult {
   date: string | null;
 }
 
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
+}
+
+export interface DownloadedUpdateInfo {
+  ready: boolean;
+  version: string | null;
+  deferred: boolean;
+}
+
 export interface NavItem {
   id: AppPage;
   label: string;

@@ -4,10 +4,12 @@ import type {
   AppInfo,
   AuthState,
   CliToolStatus,
+  DownloadedUpdateInfo,
   ExploreItem,
   MarketplaceItem,
   MarketplaceSyncResult,
   UpdateCheckResult,
+  UpdateDownloadProgress,
   UsageSummary,
 } from "@/types";
 
@@ -109,8 +111,28 @@ export async function checkForUpdate(): Promise<UpdateCheckResult> {
   return invoke("check_for_update");
 }
 
-export async function installAvailableUpdate(): Promise<void> {
-  return invoke("install_available_update");
+export async function getDownloadedUpdateInfo(): Promise<DownloadedUpdateInfo> {
+  return invoke("get_downloaded_update_info");
+}
+
+export async function downloadAvailableUpdate(): Promise<void> {
+  return invoke("download_available_update");
+}
+
+export async function installDownloadedUpdate(): Promise<void> {
+  return invoke("install_downloaded_update");
+}
+
+export async function deferDownloadedUpdate(): Promise<void> {
+  return invoke("defer_downloaded_update");
+}
+
+export function onUpdateDownloadProgress(
+  callback: (progress: UpdateDownloadProgress) => void,
+) {
+  return listen<UpdateDownloadProgress>("update-download-progress", (event) => {
+    callback(event.payload);
+  });
 }
 
 export async function getUsageSummary(): Promise<UsageSummary> {
