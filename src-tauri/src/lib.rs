@@ -2,6 +2,7 @@ mod auth;
 mod cli_tools;
 mod codex_plugins;
 mod config;
+mod grayscale_api;
 mod device;
 mod macos_scheme;
 mod marketplace;
@@ -48,11 +49,11 @@ fn get_proxy_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn set_proxy_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+async fn set_proxy_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     let mut settings = store::load_settings(&app)?;
     settings.proxy_enabled = enabled;
     store::save_settings(&app, &settings)?;
-    cli_tools::apply_config_injection(&app)
+    cli_tools::apply_config_injection_async(&app).await
 }
 
 #[tauri::command]
@@ -61,8 +62,8 @@ async fn refresh_user_profile(app: tauri::AppHandle) -> Result<AuthState, String
 }
 
 #[tauri::command]
-fn apply_config_injection(app: tauri::AppHandle) -> Result<(), String> {
-    cli_tools::apply_config_injection(&app)
+async fn apply_config_injection(app: tauri::AppHandle) -> Result<(), String> {
+    cli_tools::apply_config_injection_async(&app).await
 }
 
 #[tauri::command]

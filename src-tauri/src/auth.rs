@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::device;
-use crate::store::{clear_auth, load_auth, save_auth, StoredAuth};
+use crate::store::{clear_auth, load_auth, load_settings, save_auth, save_settings, StoredAuth};
 use crate::user_api::{
     exchange_device_code, fetch_user_me, parse_deep_link_auth, register_device, revoke_device,
     ApiError, UserProfile,
@@ -39,9 +39,59 @@ fn resolve_api_base_url(auth: &StoredAuth) -> String {
     crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref())
 }
 
+fn is_device_credential(token: &str) -> bool {
+    token.starts_with("bf-tmp-")
+}
+
+/// 供灰度模型、用户资料、市场等 Aone 管理接口使用的浏览器会话 token。
+pub fn resolve_aone_session_token(auth: &StoredAuth) -> Option<String> {
+    auth.session_token
+        .clone()
+        .filter(|token| !token.is_empty() && !is_device_credential(token))
+        .or_else(|| {
+            auth.access_token
+                .clone()
+                .filter(|token| !token.is_empty() && !is_device_credential(token))
+        })
+}
+
+pub async fn resolve_aone_session_token_for_api(app: &AppHandle) -> Result<String, String> {
+    let auth = load_auth(app)?;
+    if auth.authorization_code.is_none() {
+        return Err(fail_auth_session_async(app, "请先登录").await);
+    }
+    resolve_aone_session_token(&auth)
+        .ok_or_else(|| "登录会话已过期，请重新登录".to_string())
+}
+
+fn disable_proxy_and_restore_configs(app: &AppHandle) -> Result<(), String> {
+    let mut settings = load_settings(app)?;
+    if settings.proxy_enabled {
+        settings.proxy_enabled = false;
+        save_settings(app, &settings)?;
+    }
+    crate::cli_tools::apply_config_injection(app)
+}
+
+async fn disable_proxy_and_restore_configs_async(app: &AppHandle) -> Result<(), String> {
+    let mut settings = load_settings(app)?;
+    if settings.proxy_enabled {
+        settings.proxy_enabled = false;
+        save_settings(app, &settings)?;
+    }
+    crate::cli_tools::apply_config_injection_async(app).await
+}
+
+async fn clear_logged_in_state_async(app: &AppHandle) -> Result<AuthState, String> {
+    crate::proxy::clear_credential_cache();
+    let _ = disable_proxy_and_restore_configs_async(app).await;
+    clear_auth(app)?;
+    emit_auth_changed(app)
+}
+
 fn clear_logged_in_state(app: &AppHandle) -> Result<AuthState, String> {
     crate::proxy::clear_credential_cache();
-    let _ = crate::cli_tools::apply_config_injection(app);
+    let _ = disable_proxy_and_restore_configs(app);
     clear_auth(app)?;
     emit_auth_changed(app)
 }
@@ -53,6 +103,13 @@ pub fn logout(app: &AppHandle) -> Result<(), String> {
 }
 
 /// 授权失效时清理本地登录态并通知前端回到登录页。
+pub async fn force_logout_async(app: &AppHandle, reason: &str) -> Result<AuthState, String> {
+    let state = clear_logged_in_state_async(app).await?;
+    emit_login_failed(app, reason);
+    Ok(state)
+}
+
+/// 授权失效时清理本地登录态并通知前端回到登录页（仅用于同步上下文）。
 pub fn force_logout(app: &AppHandle, reason: &str) -> Result<AuthState, String> {
     let state = clear_logged_in_state(app)?;
     emit_login_failed(app, reason);
@@ -60,6 +117,19 @@ pub fn force_logout(app: &AppHandle, reason: &str) -> Result<AuthState, String> 
 }
 
 /// 会话失效时强制登出并返回错误文案（已有登录态才清理，避免未登录时误报）。
+pub async fn fail_auth_session_async(app: &AppHandle, reason: impl Into<String>) -> String {
+    let reason = reason.into();
+    if load_auth(app)
+        .ok()
+        .and_then(|auth| auth.authorization_code)
+        .is_some()
+    {
+        let _ = force_logout_async(app, &reason).await;
+    }
+    reason
+}
+
+/// 会话失效时强制登出并返回错误文案（仅用于同步上下文）。
 pub fn fail_auth_session(app: &AppHandle, reason: impl Into<String>) -> String {
     let reason = reason.into();
     if load_auth(app)
@@ -124,70 +194,42 @@ pub async fn refresh_user_profile(app: &AppHandle) -> Result<AuthState, String> 
     match sync_profile(app).await {
         Ok(_) => emit_auth_changed(app),
         Err(ApiError::AuthCodeRejected) => {
-            Ok(force_logout(
+            Ok(force_logout_async(
                 app,
                 &ApiError::AuthCodeRejected.message(),
-            )?)
+            )
+            .await?)
         }
-        Err(ApiError::Unauthorized) => Ok(force_logout(
-            app,
-            &ApiError::Unauthorized.message(),
-        )?),
+        Err(ApiError::Unauthorized) => {
+            Ok(force_logout_async(app, &ApiError::Unauthorized.message()).await?)
+        }
         Err(e) => Err(e.message()),
     }
 }
 
-/// 用当前 access_token 拉取用户资料；若 token 过期则用授权码静默续期后重试。
+/// 用浏览器会话 token 拉取用户资料；会话过期需重新登录（设备凭证不能替代会话）。
 async fn sync_profile(app: &AppHandle) -> Result<(), ApiError> {
     let auth = load_auth(app).map_err(ApiError::Other)?;
     let base = resolve_api_base_url(&auth);
+    let session_token = resolve_aone_session_token(&auth).ok_or(ApiError::Unauthorized)?;
+    let profile = fetch_user_me(&session_token, &base).await?;
 
-    let attempt = match auth.access_token.as_deref() {
-        Some(token) => fetch_user_me(token, &base).await,
-        None => Err(ApiError::Unauthorized),
-    };
-
-    let (session_token, profile, base_after) = match attempt {
-        Ok(profile) => (
-            auth.access_token.clone().unwrap_or_default(),
-            profile,
-            base.clone(),
-        ),
-        Err(ApiError::Unauthorized) => {
-            let token = refresh_access_token(app, &auth, &base).await?;
-            // 续期可能更新了 base_url，重新读取后再请求。
-            let refreshed = load_auth(app).map_err(ApiError::Other)?;
-            let base = resolve_api_base_url(&refreshed);
-            let profile = fetch_user_me(&token, &base).await?;
-            (token, profile, base)
-        }
-        Err(e) => return Err(e),
-    };
-
-    save_profile(app, &session_token, Some(base_after.as_str()), profile)
+    save_profile(app, &session_token, Some(base.as_str()), profile)
         .map_err(ApiError::Other)?;
+
+    if load_settings(app)
+        .ok()
+        .is_some_and(|settings| settings.proxy_enabled)
+    {
+        let _ = crate::cli_tools::apply_config_injection_async(app).await;
+    }
 
     Ok(())
 }
 
-/// 获取可用于 API 请求的 session token，必要时静默续期。
+/// 获取 Aone 管理接口可用的浏览器会话 token。
 pub async fn resolve_session_token(app: &AppHandle) -> Result<String, String> {
-    let auth = load_auth(app)?;
-    if auth.authorization_code.is_none() {
-        return Err(fail_auth_session(app, "请先登录"));
-    }
-    let base = resolve_api_base_url(&auth);
-    if let Some(token) = auth.access_token.clone() {
-        return Ok(token);
-    }
-    match refresh_access_token(app, &auth, &base).await {
-        Ok(token) => Ok(token),
-        Err(ApiError::AuthCodeRejected) => {
-            force_logout(app, &ApiError::AuthCodeRejected.message())?;
-            Err(ApiError::AuthCodeRejected.message())
-        }
-        Err(e) => Err(e.message()),
-    }
+    resolve_aone_session_token_for_api(app).await
 }
 
 /// 强制用授权码换取新的 access_token。
@@ -212,14 +254,14 @@ async fn refresh_access_token(
     let resp = exchange_device_code(&code, &fingerprint, base).await?;
 
     let mut updated = load_auth(app).map_err(ApiError::Other)?;
-    updated.access_token = Some(resp.access_token.clone());
+    updated.access_token = Some(resp.credential().to_string());
     if resp.base_url.is_some() {
         updated.api_base_url =
             Some(crate::user_api::resolve_api_base_url(resp.base_url.as_deref()));
     }
     save_auth(app, &updated).map_err(ApiError::Other)?;
 
-    Ok(resp.access_token)
+    Ok(resp.credential().to_string())
 }
 
 /// 登录回调里的 base_url 可能为 http 或缺少 /zai；release 统一使用应用配置的 https 地址。
@@ -260,6 +302,14 @@ async fn complete_login(
 
     save_profile(app, &payload.access_token, Some(&api_base_url), profile)?;
     emit_auth_changed(app)?;
+
+    if load_settings(app)
+        .ok()
+        .is_some_and(|settings| settings.proxy_enabled)
+    {
+        let _ = crate::cli_tools::apply_config_injection_async(app).await;
+    }
+
     Ok(())
 }
 
@@ -271,7 +321,10 @@ fn save_profile(
     profile: UserProfile,
 ) -> Result<(), String> {
     let mut auth = load_auth(app)?;
-    auth.access_token = Some(session_token.to_string());
+    if !is_device_credential(session_token) {
+        auth.session_token = Some(session_token.to_string());
+        auth.access_token = Some(session_token.to_string());
+    }
     if let Some(base) = api_base_url {
         auth.api_base_url = Some(base.to_string());
     }

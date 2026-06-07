@@ -56,7 +56,10 @@ fn migrate_legacy_store(app: &AppHandle, store: &AppStore) -> Result<(), String>
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredAuth {
-    /// 短期工作态 token，可随时被授权码换取的新 token 覆盖。
+    /// 浏览器登录后的 Aone 会话 token，供灰度模型、用户资料等管理接口使用。
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// 设备临时凭证（`bf-tmp-...`），供本地代理转发 AI 请求使用。
     pub access_token: Option<String>,
     /// 桌面端长期凭证：设备授权码，用于独立于 web 续期 access_token。
     #[serde(default)]

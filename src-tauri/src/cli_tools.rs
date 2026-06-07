@@ -1,4 +1,5 @@
 use crate::config::LOCAL_PROXY_HOST;
+use crate::grayscale_api::{fetch_grayscale_models, find_platform_models, GrayscaleModelEntry};
 use crate::store::StoredSettings;
 use crate::store::{load_auth, load_backup, load_settings, save_backup};
 use regex::Regex;
@@ -31,18 +32,24 @@ enum ConfigFormat {
     CodexProviderToml,
 }
 
-/// Codex 自定义 model provider，与官方 config.toml 结构一致。
-const CODEX_MODEL_PROVIDER: &str = "zsdx_ai";
-const CODEX_PROVIDER_NAME: &str = "ZSDX AI";
-const CODEX_DEFAULT_MODEL: &str = "gpt-4";
+/// 旧版注入使用的自定义 provider，还原时需清理。
+const LEGACY_CODEX_MODEL_PROVIDER: &str = "zsdx_ai";
+const CODEX_OPENAI_BASE_URL_KEY: &str = "openai_base_url";
 
 const CODEX_CONFIG_FIELDS: &[&str] = &[
     "snapshot",
+    "openai_base_url",
     "model",
     "model_provider",
     "model_field_order",
+    "model_catalog_json",
     "model_providers.zsdx_ai",
 ];
+
+const CLAUDE_CUSTOM_MODEL_ENV_PREFIX: &str = "ANTHROPIC_CUSTOM_MODEL_OPTION";
+const CLAUDE_GATEWAY_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
+const ZWITCH_MANAGED_MODEL_CATALOG_MARKER: &str = "zwitch-grayscale-catalog.json";
+const CODEX_GRAYSCALE_CATALOG_RELATIVE: &str = ".codex/zwitch-grayscale-catalog.json";
 
 /// 备份中标记「注入前不存在」的占位值。
 const BACKUP_ABSENT: &str = "\0zwitch_absent\0";
@@ -101,7 +108,7 @@ const TOOLS: &[ToolDefinition] = &[
         id: "codex",
         name: "Codex CLI",
         binaries: &["codex"],
-        base_url_field: "model_providers.zsdx_ai.base_url",
+        base_url_field: "openai_base_url",
         token_field: "OPENAI_API_KEY",
         install_url: "https://developers.openai.com/codex/cli",
         targets: CODEX_TARGETS,
@@ -160,6 +167,10 @@ pub fn get_cli_tools_status(_app: &AppHandle) -> Result<Vec<CliToolStatus>, Stri
 }
 
 pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
+    tauri::async_runtime::block_on(apply_config_injection_async(app))
+}
+
+pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String> {
     let settings = load_settings(app)?;
     let auth = load_auth(app)?;
     let mut backup = load_backup(app)?;
@@ -172,6 +183,13 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
     if needs_inject && auth.authorization_code.is_none() {
         return Err("请先登录并完成设备授权".to_string());
     }
+
+    let grayscale_models = if needs_inject {
+        load_grayscale_models_by_platform(app).await
+    } else {
+        HashMap::new()
+    };
+    crate::grayscale_api::update_grayscale_cache(grayscale_models.clone());
 
     if needs_inject {
         let preferred = detect_preferred_proxy_port(&home, &settings)?;
@@ -190,6 +208,10 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
         } else {
             crate::proxy::local_proxy_base(tool.id)
         };
+        let additional_models = grayscale_models
+            .get(tool.id)
+            .cloned()
+            .unwrap_or_default();
 
         for target in tool.targets {
             let config_path = home.join(target.relative);
@@ -214,7 +236,14 @@ pub fn apply_config_injection(app: &AppHandle) -> Result<(), String> {
                 backup_dirty = true;
             }
 
-            inject_values(target, &config_path, &local_base)?;
+            inject_values(
+                tool,
+                target,
+                &config_path,
+                &local_base,
+                &additional_models,
+                &home,
+            )?;
         }
     }
 
@@ -457,6 +486,9 @@ fn backup_current_values(
                     .unwrap_or_else(|| BACKUP_ABSENT.to_string());
                 entry.insert(backup_field_key, stored);
             }
+            if tool.id == "claude" {
+                backup_claude_grayscale_env(entry, tool.id, &value);
+            }
         }
         ConfigFormat::Toml => {
             for field in target.fields {
@@ -530,11 +562,13 @@ fn read_injected_proxy_port(
     }
 
     match target.format {
-        ConfigFormat::CodexProviderToml => {
-            extract_toml_section(content, codex_provider_table_header())
-                .and_then(|body| read_toml_assignment(&body, "base_url"))
-                .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
-        }
+        ConfigFormat::CodexProviderToml => read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
+            .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+            .or_else(|| {
+                extract_toml_section(content, legacy_codex_provider_table_header())
+                    .and_then(|body| read_toml_assignment(&body, "base_url"))
+                    .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+            }),
         ConfigFormat::Json => serde_json::from_str::<Value>(content)
             .ok()
             .and_then(|value| {
@@ -637,6 +671,13 @@ fn restore_config(
 
     if matches!(target.format, ConfigFormat::CodexProviderToml) {
         content = restore_codex_provider_toml(&content, tool.id, &file_backup)?;
+        if let Some(home) = dirs::home_dir() {
+            let _ = remove_managed_grayscale_artifacts(tool, &home);
+        }
+    }
+
+    if matches!(target.format, ConfigFormat::Json) && tool.id == "claude" {
+        content = restore_claude_grayscale_env(&content, tool.id, &file_backup)?;
     }
 
     write_config(config_path, &content)?;
@@ -644,7 +685,14 @@ fn restore_config(
     Ok(true)
 }
 
-fn inject_values(target: &ConfigTarget, config_path: &Path, base_url: &str) -> Result<(), String> {
+fn inject_values(
+    _tool: &ToolDefinition,
+    target: &ConfigTarget,
+    config_path: &Path,
+    base_url: &str,
+    additional_models: &[GrayscaleModelEntry],
+    _home: &Path,
+) -> Result<(), String> {
     ensure_parent(config_path)?;
 
     let content = if config_path.exists() {
@@ -674,6 +722,7 @@ fn inject_values(target: &ConfigTarget, config_path: &Path, base_url: &str) -> R
                 );
             }
 
+            inject_claude_grayscale_models(&mut value, additional_models);
             serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         }
         ConfigFormat::Toml => {
@@ -684,7 +733,7 @@ fn inject_values(target: &ConfigTarget, config_path: &Path, base_url: &str) -> R
             }
             result
         }
-        ConfigFormat::CodexProviderToml => inject_codex_provider_config(&content, base_url)?,
+        ConfigFormat::CodexProviderToml => inject_codex_openai_proxy_config(&content, base_url)?,
         ConfigFormat::DotEnv => {
             let mut result = content;
             for field in target.fields {
@@ -696,6 +745,132 @@ fn inject_values(target: &ConfigTarget, config_path: &Path, base_url: &str) -> R
     };
 
     write_config(config_path, &new_content)
+}
+
+async fn load_grayscale_models_by_platform(
+    app: &AppHandle,
+) -> HashMap<String, Vec<GrayscaleModelEntry>> {
+    let auth = match load_auth(app) {
+        Ok(auth) => auth,
+        Err(_) => return HashMap::new(),
+    };
+    let api_base = crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref());
+
+    let Some(credential) = crate::auth::resolve_aone_session_token(&auth) else {
+        eprintln!("拉取灰度模型失败: 缺少浏览器登录会话，请重新登录");
+        return HashMap::new();
+    };
+
+    let response = match fetch_grayscale_models(None, &credential, &api_base).await {
+        Ok(response) => response,
+        Err(crate::user_api::ApiError::Unauthorized) => {
+            eprintln!("拉取灰度模型失败: 登录会话已过期，请重新登录");
+            return HashMap::new();
+        }
+        Err(error) => {
+            eprintln!("拉取灰度模型失败: {}", error.message());
+            return HashMap::new();
+        }
+    };
+
+    let mut by_platform = HashMap::new();
+    for tool in TOOLS {
+        let Some(platform) = find_platform_models(&response, tool.id) else {
+            continue;
+        };
+        if !platform.additional_models.is_empty() {
+            by_platform.insert(tool.id.to_string(), platform.additional_models.clone());
+        }
+    }
+
+    by_platform
+}
+
+fn is_zwitch_managed_custom_model_env_key(key: &str) -> bool {
+    key == CLAUDE_CUSTOM_MODEL_ENV_PREFIX
+        || key.starts_with(&format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_"))
+        || key == CLAUDE_GATEWAY_DISCOVERY_ENV
+}
+
+fn claude_custom_model_env_keys(index: usize) -> (String, String, String) {
+    if index == 0 {
+        (
+            CLAUDE_CUSTOM_MODEL_ENV_PREFIX.to_string(),
+            format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_NAME"),
+            format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_DESCRIPTION"),
+        )
+    } else {
+        let suffix = index + 1;
+        (
+            format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_{suffix}"),
+            format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_NAME_{suffix}"),
+            format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_DESCRIPTION_{suffix}"),
+        )
+    }
+}
+
+fn inject_claude_grayscale_models(value: &mut Value, additional_models: &[GrayscaleModelEntry]) {
+    let env = ensure_json_env_object(value);
+
+    let managed_keys: Vec<String> = env
+        .keys()
+        .filter(|key| is_zwitch_managed_custom_model_env_key(key))
+        .cloned()
+        .collect();
+    for key in managed_keys {
+        env.remove(&key);
+    }
+
+    if !additional_models.is_empty() {
+        env.insert(
+            CLAUDE_GATEWAY_DISCOVERY_ENV.to_string(),
+            Value::String("1".to_string()),
+        );
+    } else {
+        env.remove(CLAUDE_GATEWAY_DISCOVERY_ENV);
+    }
+
+    for (index, model) in additional_models.iter().enumerate() {
+        let (id_key, name_key, description_key) = claude_custom_model_env_keys(index);
+        let display_name = format!("{} [灰度]", model.id);
+        let description = if model.key_name.is_empty() {
+            "灰度模型".to_string()
+        } else {
+            format!("{}（灰度）", model.key_name)
+        };
+        env.insert(id_key, Value::String(model.id.clone()));
+        env.insert(name_key, Value::String(display_name));
+        env.insert(description_key, Value::String(description));
+    }
+}
+
+fn ensure_json_env_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+    let root = value.as_object_mut().expect("settings root must be object");
+    if !root.contains_key("env") {
+        root.insert("env".to_string(), Value::Object(Default::default()));
+    }
+    root.get_mut("env")
+        .and_then(Value::as_object_mut)
+        .expect("env must be object")
+}
+
+fn codex_grayscale_catalog_path(home: &Path) -> PathBuf {
+    home.join(CODEX_GRAYSCALE_CATALOG_RELATIVE)
+}
+
+fn remove_managed_grayscale_artifacts(tool: &ToolDefinition, home: &Path) -> Result<(), String> {
+    if tool.id == "codex" {
+        let catalog_path = codex_grayscale_catalog_path(home);
+        if catalog_path.exists() {
+            fs::remove_file(&catalog_path)
+                .map_err(|e| format!("删除灰度模型目录失败 {}: {e}", catalog_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn is_zwitch_managed_model_catalog_path(path: &str) -> bool {
+    path.contains(ZWITCH_MANAGED_MODEL_CATALOG_MARKER)
 }
 
 fn read_json_field(value: &Value, path: &str) -> Option<String> {
@@ -802,7 +977,7 @@ fn toml_quote(value: &str) -> String {
     format!("\"{}\"", escape_toml_string(value))
 }
 
-fn codex_provider_table_header() -> &'static str {
+fn legacy_codex_provider_table_header() -> &'static str {
     "[model_providers.zsdx_ai]"
 }
 
@@ -827,7 +1002,11 @@ fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str
     } else {
         order.join(",")
     };
-    let section_backup = extract_toml_section(content, codex_provider_table_header())
+    let openai_base_url_backup = read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
+        .unwrap_or_else(|| BACKUP_ABSENT.to_string());
+    let catalog_backup = read_top_level_toml_value(content, "model_catalog_json")
+        .unwrap_or_else(|| BACKUP_ABSENT.to_string());
+    let section_backup = extract_toml_section(content, legacy_codex_provider_table_header())
         .unwrap_or_else(|| BACKUP_ABSENT.to_string());
 
     for field in codex_config_fields() {
@@ -839,9 +1018,11 @@ fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str
             continue;
         }
         let stored = match *field {
+            "openai_base_url" => openai_base_url_backup.clone(),
             "model" => model_backup.clone(),
             "model_provider" => provider_backup.clone(),
             "model_field_order" => order_backup.clone(),
+            "model_catalog_json" => catalog_backup.clone(),
             "model_providers.zsdx_ai" => section_backup.clone(),
             _ => BACKUP_ABSENT.to_string(),
         };
@@ -850,9 +1031,15 @@ fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str
 }
 
 fn is_zwitch_injected(content: &str) -> bool {
-    extract_toml_section(content, codex_provider_table_header()).is_some()
+    if read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
+        .is_some_and(|url| is_local_proxy_base_url(&url, "codex"))
+    {
+        return true;
+    }
+
+    extract_toml_section(content, legacy_codex_provider_table_header()).is_some()
         && read_top_level_toml_value(content, "model_provider").as_deref()
-            == Some(CODEX_MODEL_PROVIDER)
+            == Some(LEGACY_CODEX_MODEL_PROVIDER)
 }
 
 fn scan_top_level_model_fields(content: &str) -> (Option<String>, Option<String>, Vec<String>) {
@@ -916,7 +1103,7 @@ fn rebuild_codex_config(
     field_order: &[String],
     provider_section_body: Option<&str>,
 ) -> Result<String, String> {
-    let header = codex_provider_table_header();
+    let header = legacy_codex_provider_table_header();
     let mut without_managed = remove_toml_section(content, header);
     for key in ["model", "model_provider"] {
         without_managed = remove_top_level_toml_key(&without_managed, key);
@@ -964,6 +1151,72 @@ fn rebuild_codex_config(
     Ok(normalize_toml_newlines(&out.join("\n")))
 }
 
+fn backup_claude_grayscale_env(
+    entry: &mut HashMap<String, String>,
+    tool_id: &str,
+    value: &Value,
+) {
+    let Some(env) = value.get("env").and_then(Value::as_object) else {
+        return;
+    };
+    for (key, env_value) in env {
+        if !is_zwitch_managed_custom_model_env_key(key) {
+            continue;
+        }
+        let backup_field_key = backup_key(tool_id, &format!("env.{key}"));
+        if entry.contains_key(&backup_field_key) {
+            continue;
+        }
+        let stored = env_value
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| BACKUP_ABSENT.to_string());
+        entry.insert(backup_field_key, stored);
+    }
+}
+
+fn restore_claude_grayscale_env(
+    content: &str,
+    tool_id: &str,
+    file_backup: &HashMap<String, String>,
+) -> Result<String, String> {
+    let mut value: Value = serde_json::from_str(content).map_err(|e| format!("解析 JSON 失败: {e}"))?;
+    let Some(env) = value
+        .as_object_mut()
+        .and_then(|root| root.get_mut("env"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(content.to_string());
+    };
+
+    let had_managed_keys = env
+        .keys()
+        .any(|key| is_zwitch_managed_custom_model_env_key(key));
+    env.retain(|key, _| !is_zwitch_managed_custom_model_env_key(key));
+
+    let mut restored_any = false;
+    for (backup_key, original) in file_backup {
+        let prefix = format!("{tool_id}::env.");
+        let Some(env_key) = backup_key.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !is_zwitch_managed_custom_model_env_key(env_key) {
+            continue;
+        }
+        if original == BACKUP_ABSENT {
+            continue;
+        }
+        env.insert(env_key.to_string(), Value::String(original.clone()));
+        restored_any = true;
+    }
+
+    if !had_managed_keys && !restored_any {
+        return Ok(content.to_string());
+    }
+
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
 fn restore_codex_provider_toml(
     content: &str,
     tool_id: &str,
@@ -974,44 +1227,60 @@ fn restore_codex_provider_toml(
     }
 
     let stripped = strip_injected_codex_config(content);
-    let (model, model_provider, field_order) = sanitized_codex_restore_fields(file_backup, tool_id);
+    let (model, model_provider, field_order, catalog_json, openai_base_url) =
+        sanitized_codex_restore_fields(file_backup, tool_id);
 
-    if model.is_none() && model_provider.is_none() {
-        return Ok(stripped);
+    let mut restored = if model.is_none() && model_provider.is_none() {
+        stripped
+    } else {
+        rebuild_codex_config(
+            &stripped,
+            model.as_deref(),
+            model_provider.as_deref(),
+            &field_order,
+            None,
+        )?
+    };
+
+    if let Some(url) = openai_base_url {
+        restored = upsert_top_level_toml_key(&restored, CODEX_OPENAI_BASE_URL_KEY, &url)?;
     }
 
-    rebuild_codex_config(
-        &stripped,
-        model.as_deref(),
-        model_provider.as_deref(),
-        &field_order,
-        None,
-    )
+    if let Some(catalog_json) = catalog_json {
+        restored = upsert_top_level_toml_key(&restored, "model_catalog_json", &catalog_json)?;
+    } else {
+        restored = remove_managed_codex_model_catalog(&restored);
+    }
+
+    Ok(restored)
 }
 
 fn sanitized_codex_restore_fields(
     file_backup: &HashMap<String, String>,
     tool_id: &str,
-) -> (Option<String>, Option<String>, Vec<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+) {
     let model_raw = file_backup.get(&backup_key(tool_id, "model"));
     let provider_raw = file_backup.get(&backup_key(tool_id, "model_provider"));
 
     let provider_was_injected = provider_raw
         .map(String::as_str)
-        .is_some_and(|value| value == CODEX_MODEL_PROVIDER);
+        .is_some_and(|value| value == LEGACY_CODEX_MODEL_PROVIDER);
 
     let model = model_raw.and_then(|value| {
-        if value == BACKUP_ABSENT {
-            return None;
-        }
-        if provider_was_injected && value == CODEX_DEFAULT_MODEL {
+        if value == BACKUP_ABSENT || provider_was_injected {
             return None;
         }
         Some(value.clone())
     });
 
     let model_provider = provider_raw.and_then(|value| {
-        if value == BACKUP_ABSENT || value == CODEX_MODEL_PROVIDER {
+        if value == BACKUP_ABSENT || value == LEGACY_CODEX_MODEL_PROVIDER {
             return None;
         }
         Some(value.clone())
@@ -1024,51 +1293,63 @@ fn sanitized_codex_restore_fields(
         .filter(|order| !order.is_empty())
         .unwrap_or_else(|| vec!["model".to_string(), "model_provider".to_string()]);
 
-    (model, model_provider, field_order)
+    let catalog_json = file_backup
+        .get(&backup_key(tool_id, "model_catalog_json"))
+        .and_then(|value| {
+            if value == BACKUP_ABSENT {
+                None
+            } else {
+                Some(value.clone())
+            }
+        });
+
+    let openai_base_url = file_backup
+        .get(&backup_key(tool_id, "openai_base_url"))
+        .and_then(|value| {
+            if value == BACKUP_ABSENT {
+                None
+            } else {
+                Some(value.clone())
+            }
+        });
+
+    (model, model_provider, field_order, catalog_json, openai_base_url)
 }
 
 fn strip_injected_codex_config(content: &str) -> String {
-    let header = codex_provider_table_header();
-    let mut result = remove_toml_section(content, header);
-    for key in ["model", "model_provider"] {
-        result = remove_top_level_toml_key(&result, key);
+    let mut result = remove_toml_section(content, legacy_codex_provider_table_header());
+
+    if read_top_level_toml_value(&result, CODEX_OPENAI_BASE_URL_KEY)
+        .is_some_and(|url| is_local_proxy_base_url(&url, "codex"))
+    {
+        result = remove_top_level_toml_key(&result, CODEX_OPENAI_BASE_URL_KEY);
     }
+
+    if read_top_level_toml_value(&result, "model_provider").as_deref()
+        == Some(LEGACY_CODEX_MODEL_PROVIDER)
+    {
+        result = remove_top_level_toml_key(&result, "model_provider");
+    }
+
+    result = remove_managed_codex_model_catalog(&result);
     normalize_toml_newlines(&result)
 }
 
-fn inject_codex_provider_config(content: &str, base_url: &str) -> Result<String, String> {
-    let (existing_model, _, existing_order) = scan_top_level_model_fields(content);
-    let model = existing_model.as_deref();
-    let section_body = format_codex_provider_section_body(base_url);
-
-    let mut field_order: Vec<String> = if existing_order.is_empty() {
-        vec!["model_provider".to_string()]
-    } else {
-        existing_order
-            .into_iter()
-            .filter(|key| key != "model" || model.is_some())
-            .collect()
-    };
-    if !field_order.iter().any(|key| key == "model_provider") {
-        field_order.push("model_provider".to_string());
-    }
-
-    rebuild_codex_config(
-        content,
-        model,
-        Some(CODEX_MODEL_PROVIDER),
-        &field_order,
-        Some(&section_body),
-    )
+fn inject_codex_openai_proxy_config(content: &str, base_url: &str) -> Result<String, String> {
+    let cleaned = strip_injected_codex_config(content);
+    upsert_top_level_toml_key(&cleaned, CODEX_OPENAI_BASE_URL_KEY, base_url)
 }
 
-fn format_codex_provider_section_body(base_url: &str) -> String {
-    format!(
-        r#"name = "{CODEX_PROVIDER_NAME}"
-base_url = {base_url}
-wire_api = "responses""#,
-        base_url = toml_quote(base_url),
-    )
+fn remove_managed_codex_model_catalog(content: &str) -> String {
+    let current = read_top_level_toml_value(content, "model_catalog_json");
+    if current
+        .as_deref()
+        .is_some_and(is_zwitch_managed_model_catalog_path)
+    {
+        remove_top_level_toml_key(content, "model_catalog_json")
+    } else {
+        content.to_string()
+    }
 }
 
 fn split_toml_top_level(content: &str) -> (Vec<String>, Vec<String>) {
@@ -1270,8 +1551,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_uses_custom_model_provider() {
-        assert_eq!(TOOLS[0].base_url_field, "model_providers.zsdx_ai.base_url");
+    fn codex_uses_openai_base_url_field() {
+        assert_eq!(TOOLS[0].base_url_field, "openai_base_url");
         assert_eq!(TOOLS[0].token_field, "OPENAI_API_KEY");
         assert!(matches!(
             CODEX_TARGETS[0].format,
@@ -1280,22 +1561,18 @@ mod tests {
     }
 
     #[test]
-    fn codex_inject_writes_provider_section() {
-        let injected = inject_codex_provider_config("", "http://127.0.0.1:51805/codex").unwrap();
+    fn codex_inject_writes_openai_base_url() {
+        let injected =
+            inject_codex_openai_proxy_config("", "http://127.0.0.1:51805/codex").unwrap();
         assert_eq!(
             injected,
-            r#"model_provider = "zsdx_ai"
-
-[model_providers.zsdx_ai]
-name = "ZSDX AI"
-base_url = "http://127.0.0.1:51805/codex"
-wire_api = "responses"
+            r#"openai_base_url = "http://127.0.0.1:51805/codex"
 "#
         );
     }
 
     #[test]
-    fn codex_inject_replaces_existing_provider_and_preserves_other_tables() {
+    fn codex_inject_preserves_model_provider_and_other_tables() {
         let original = r#"model_provider = "bifrost"
 model = "gpt-5.4"
 
@@ -1303,18 +1580,28 @@ model = "gpt-5.4"
 base_url = "http://127.0.0.1:51805/codex"
 "#;
         let injected =
-            inject_codex_provider_config(original, "http://127.0.0.1:9999/codex").unwrap();
-        assert!(injected.starts_with(
-            r#"model_provider = "zsdx_ai"
-model = "gpt-5.4"
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:9999/codex").unwrap();
+        assert!(injected.contains(r#"openai_base_url = "http://127.0.0.1:9999/codex""#));
+        assert!(injected.contains(r#"model_provider = "bifrost""#));
+        assert!(injected.contains(r#"model = "gpt-5.4""#));
+        assert!(injected.contains("[model_providers.bifrost]"));
+        assert!(!injected.contains("[model_providers.zsdx_ai]"));
+    }
+
+    #[test]
+    fn codex_inject_migrates_legacy_zsdx_ai_provider() {
+        let legacy = r#"model_provider = "zsdx_ai"
 
 [model_providers.zsdx_ai]
 name = "ZSDX AI"
-base_url = "http://127.0.0.1:9999/codex"
+base_url = "http://127.0.0.1:51805/codex"
 wire_api = "responses"
-"#
-        ));
-        assert!(injected.contains("[model_providers.bifrost]"));
+"#;
+        let injected =
+            inject_codex_openai_proxy_config(legacy, "http://127.0.0.1:9999/codex").unwrap();
+        assert!(injected.contains(r#"openai_base_url = "http://127.0.0.1:9999/codex""#));
+        assert!(!injected.contains("model_provider"));
+        assert!(!injected.contains("[model_providers.zsdx_ai]"));
     }
 
     #[test]
@@ -1327,7 +1614,7 @@ base_url = "http://old.example/codex"
         let mut backup = HashMap::new();
         backup_codex_provider_toml(&mut backup, "codex", original);
         let injected =
-            inject_codex_provider_config(original, "http://127.0.0.1:51805/codex").unwrap();
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
         let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
         assert_eq!(restored, original);
     }
@@ -1340,7 +1627,7 @@ model_provider = "bifrost"
         let mut backup = HashMap::new();
         backup_codex_provider_toml(&mut backup, "codex", original);
         let injected =
-            inject_codex_provider_config(original, "http://127.0.0.1:51805/codex").unwrap();
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
         let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
         assert_eq!(restored, original);
     }
@@ -1353,14 +1640,14 @@ model = "gpt-5.4"
         let mut backup = HashMap::new();
         backup_codex_provider_toml(&mut backup, "codex", original);
         let injected =
-            inject_codex_provider_config(original, "http://127.0.0.1:51805/codex").unwrap();
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
         let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
         assert_eq!(restored, original);
     }
 
     #[test]
     fn codex_restore_without_backup_strips_injected_values() {
-        let injected = inject_codex_provider_config(
+        let injected = inject_codex_openai_proxy_config(
             r#"disable_response_storage = true
 "#,
             "http://127.0.0.1:51805/codex",
@@ -1378,11 +1665,10 @@ model = "gpt-5.4"
 base_url = "http://old.example/codex"
 "#;
         let injected =
-            inject_codex_provider_config(original, "http://127.0.0.1:51805/codex").unwrap();
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
 
         let mut stale_backup = HashMap::new();
-        stale_backup.insert("codex::model".into(), CODEX_DEFAULT_MODEL.into());
-        stale_backup.insert("codex::model_provider".into(), CODEX_MODEL_PROVIDER.into());
+        stale_backup.insert("codex::model_provider".into(), LEGACY_CODEX_MODEL_PROVIDER.into());
 
         let restored = restore_codex_provider_toml(&injected, "codex", &stale_backup).unwrap();
         assert_eq!(restored, original);
@@ -1390,7 +1676,8 @@ base_url = "http://old.example/codex"
 
     #[test]
     fn codex_backup_skips_already_injected_config() {
-        let injected = inject_codex_provider_config("", "http://127.0.0.1:51805/codex").unwrap();
+        let injected =
+            inject_codex_openai_proxy_config("", "http://127.0.0.1:51805/codex").unwrap();
         let mut backup = HashMap::new();
         backup.insert("codex::model".into(), BACKUP_ABSENT.into());
         backup_codex_provider_toml(&mut backup, "codex", &injected);
@@ -1407,7 +1694,19 @@ base_url = "http://old.example/codex"
         let mut backup = HashMap::new();
         backup.insert("codex::snapshot".into(), original.into());
         let injected =
-            inject_codex_provider_config(original, "http://127.0.0.1:51805/codex").unwrap();
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
+        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn codex_restore_puts_back_openai_base_url() {
+        let original = r#"openai_base_url = "https://api.openai.com/v1"
+"#;
+        let mut backup = HashMap::new();
+        backup_codex_provider_toml(&mut backup, "codex", original);
+        let injected =
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
         let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
         assert_eq!(restored, original);
     }
@@ -1454,6 +1753,54 @@ base_url = "http://old.example/codex"
         }
         assert!(
             find_binary(&["codex"]).is_some() || find_binary(&["claude"]).is_some()
+        );
+    }
+
+    #[test]
+    fn claude_injects_grayscale_models_into_env() {
+        let mut value = serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "http://example" } });
+        let models = vec![GrayscaleModelEntry {
+            id: "claude-sonnet-4-5".into(),
+            provider: "anthropic".into(),
+            key_id: "gray-anthropic".into(),
+            key_name: "灰度 Anthropic".into(),
+            source: "grayscale".into(),
+        }];
+        inject_claude_grayscale_models(&mut value, &models);
+        let env = value.get("env").unwrap().as_object().unwrap();
+        assert_eq!(
+            env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
+                .and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION").and_then(Value::as_str),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
+                .and_then(Value::as_str),
+            Some("claude-sonnet-4-5 [灰度]")
+        );
+    }
+
+    #[test]
+    fn claude_skips_gateway_discovery_without_grayscale_models() {
+        let mut value = serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "http://example" } });
+        inject_claude_grayscale_models(&mut value, &[]);
+        let env = value.get("env").unwrap().as_object().unwrap();
+        assert!(!env.contains_key("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"));
+        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
+    }
+
+    #[test]
+    fn detects_codex_local_proxy_injection() {
+        let content = r#"openai_base_url = "http://127.0.0.1:51805/codex"
+"#;
+        assert!(is_target_injected(&TOOLS[0], &CODEX_TARGETS[0], content));
+        assert_eq!(
+            read_injected_proxy_port(&TOOLS[0], &CODEX_TARGETS[0], content),
+            Some(51805)
         );
     }
 }

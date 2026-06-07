@@ -5,7 +5,7 @@ use crate::user_api::exchange_device_code;
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderName, StatusCode},
+    http::{header, HeaderName, Method, StatusCode},
     response::{IntoResponse, Response},
     Router,
 };
@@ -163,7 +163,11 @@ impl CredentialManager {
             .await
             .map_err(|e| {
                 if matches!(e, crate::user_api::ApiError::AuthCodeRejected) {
-                    let _ = crate::auth::force_logout(&self.app, &e.message());
+                    let app = self.app.clone();
+                    let message = e.message();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = crate::auth::force_logout_async(&app, &message).await;
+                    });
                 }
                 e.message()
             })?;
@@ -344,6 +348,23 @@ async fn proxy_handler_inner(
     forward_request(&state, &parts, &body_bytes, &credential).await
 }
 
+fn is_models_list_request(method: &Method, rest: &str) -> bool {
+    *method == Method::GET
+        && (rest == "v1/models" || rest.ends_with("/v1/models"))
+}
+
+fn merge_grayscale_models_into_list(
+    tool_id: &str,
+    upstream_body: &str,
+    additional: &[crate::grayscale_api::GrayscaleModelEntry],
+) -> Result<String, String> {
+    match tool_id {
+        "codex" => crate::grayscale_api::append_openai_models_list(upstream_body, additional),
+        "claude" => crate::grayscale_api::append_anthropic_models_list(upstream_body, additional),
+        _ => Ok(upstream_body.to_string()),
+    }
+}
+
 async fn forward_request(
     state: &ProxyState,
     parts: &axum::http::request::Parts,
@@ -390,6 +411,39 @@ async fn forward_request(
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("转发上游失败: {e}")))?;
+
+    let additional_models = if is_models_list_request(&parts.method, rest) {
+        crate::grayscale_api::grayscale_additional_models(tool_id)
+    } else {
+        Vec::new()
+    };
+
+    if !additional_models.is_empty() && upstream_resp.status().is_success() {
+        let status = upstream_resp.status();
+        let resp_headers = upstream_resp.headers().clone();
+        let bytes = upstream_resp
+            .bytes()
+            .await
+            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("读取上游模型列表失败: {e}")))?;
+        let upstream_text = String::from_utf8_lossy(&bytes);
+        let merged = merge_grayscale_models_into_list(tool_id, &upstream_text, &additional_models)
+            .unwrap_or_else(|error| {
+                eprintln!("合并灰度模型列表失败: {error}");
+                upstream_text.into_owned()
+            });
+
+        let mut response = Response::builder().status(status);
+        for (name, value) in resp_headers.iter() {
+            if name == header::CONTENT_LENGTH || name == header::TRANSFER_ENCODING {
+                continue;
+            }
+            response = response.header(name, value);
+        }
+        return response
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(merged))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("构建模型列表响应失败: {e}")));
+    }
 
     let usage_ctx = Provider::from_tool_id(tool_id).map(|provider| UsageContext {
         app: state.app.clone(),

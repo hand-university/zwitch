@@ -656,7 +656,7 @@ fn sync_claude_plugin_enabled_states(registry: &mut crate::store::MarketplaceReg
 async fn fetch_remote_items(app: &AppHandle) -> Result<Vec<RemoteItem>, String> {
     let auth = load_auth(app)?;
     if auth.authorization_code.is_none() {
-        return Err(auth::fail_auth_session(app, "请先登录"));
+        return Err(auth::fail_auth_session_async(app, "请先登录").await);
     }
 
     let base = resolve_api_base_url(&auth);
@@ -673,29 +673,13 @@ async fn fetch_remote_items(app: &AppHandle) -> Result<Vec<RemoteItem>, String> 
         .map_err(|e| format!("请求市场条目失败: {e}"))?;
 
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let refreshed = match auth::force_refresh_session_token(app).await {
-            Ok(token) => token,
-            Err(crate::user_api::ApiError::AuthCodeRejected) => {
-                return Err(auth::fail_auth_session(
-                    app,
-                    crate::user_api::ApiError::AuthCodeRejected.message(),
-                ));
-            }
-            Err(e) => return Err(e.message()),
-        };
-        response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {refreshed}"))
-            .header("Cookie", format!("token={refreshed}"))
-            .send()
-            .await
-            .map_err(|e| format!("请求市场条目失败: {e}"))?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(auth::fail_auth_session(
+        return Err(
+            auth::fail_auth_session_async(
                 app,
-                crate::user_api::ApiError::Unauthorized.message(),
-            ));
-        }
+                "登录会话已过期，请重新登录",
+            )
+            .await,
+        );
     }
 
     if !response.status().is_success() {

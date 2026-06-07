@@ -146,6 +146,16 @@ fn enforce_https_for_remote(url: String) -> String {
     url
 }
 
+fn normalize_known_production_api_base(url: &str) -> Option<String> {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return None;
+    };
+    if parsed.host_str() == Some("ft-app.wxhand.com") {
+        return Some(crate::config::API_BASE_URL_PROD.to_string());
+    }
+    None
+}
+
 /// 解析实际请求的 API 根地址：release 构建忽略本地开发地址。
 pub fn resolve_api_base_url(stored: Option<&str>) -> String {
     let default = AppConfig::default().api_base_url;
@@ -153,22 +163,27 @@ pub fn resolve_api_base_url(stored: Option<&str>) -> String {
         return enforce_https_for_remote(default);
     };
 
-    #[cfg(not(debug_assertions))]
-    {
-        if is_dev_only_api_base(&normalized) {
+    if let Some(prod_base) = normalize_known_production_api_base(&normalized) {
+        return enforce_https_for_remote(prod_base);
+    }
+
+    if is_dev_only_api_base(&normalized) {
+        #[cfg(not(debug_assertions))]
+        {
             return enforce_https_for_remote(default);
         }
-        // 旧版会把 /zai 路径剥掉，仅保留域名；与默认 API 同 host 时补全路径前缀。
-        if is_origin_only_api_base(&normalized) {
-            let Ok(default_url) = url::Url::parse(&default) else {
-                return enforce_https_for_remote(normalized);
-            };
-            let Ok(stored_url) = url::Url::parse(&normalized) else {
-                return enforce_https_for_remote(normalized);
-            };
-            if url_hosts_match(&default_url, &stored_url) {
-                return enforce_https_for_remote(default);
-            }
+    }
+
+    // 设备 token 返回的 base_url 可能只有域名（如 http://ft-app.wxhand.com），需补全 /zai。
+    if is_origin_only_api_base(&normalized) {
+        let Ok(default_url) = url::Url::parse(&default) else {
+            return enforce_https_for_remote(normalized);
+        };
+        let Ok(stored_url) = url::Url::parse(&normalized) else {
+            return enforce_https_for_remote(normalized);
+        };
+        if url_hosts_match(&default_url, &stored_url) {
+            return enforce_https_for_remote(default);
         }
     }
 
