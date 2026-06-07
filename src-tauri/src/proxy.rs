@@ -23,7 +23,10 @@ static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
 static PROXY_SHUTDOWN: OnceLock<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>> =
     OnceLock::new();
 
-static CREDENTIALS: OnceLock<Arc<CredentialManager>> = OnceLock::new();
+static CREDENTIALS: StdMutex<Option<Arc<CredentialManager>>> = StdMutex::new(None);
+
+/// Claude Code 可能通过 `X-Api-Key` 携带本地 API Key，需剥离后改由代理注入临时凭证。
+static X_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 
 /// 凭证过期前主动刷新的缓冲时间。
 const CREDENTIAL_REFRESH_BUFFER: Duration = Duration::from_secs(600);
@@ -92,24 +95,52 @@ pub fn ensure_listening(
     let port = match preferred {
         Some(p) if is_port_available(p) => p,
         Some(_) => find_available_port()?,
-        None if local_port() != 0 => return Some(local_port()),
+        None if local_port() != 0 => {
+            warm_credential_cache();
+            return Some(local_port());
+        }
         None => return start(app, fingerprint),
     };
 
     if local_port() == port {
+        warm_credential_cache();
         return Some(port);
     }
 
     request_proxy_shutdown();
-    start_on_port(app, fingerprint, port)
+    let started = start_on_port(app, fingerprint, port);
+    if started.is_some() {
+        warm_credential_cache();
+    }
+    started
+}
+
+fn register_credentials(manager: Arc<CredentialManager>) {
+    if let Ok(mut guard) = CREDENTIALS.lock() {
+        *guard = Some(manager);
+    }
+}
+
+fn active_credentials() -> Option<Arc<CredentialManager>> {
+    CREDENTIALS.lock().ok().and_then(|guard| guard.clone())
 }
 
 /// 登出或授权失效时清空内存中的临时凭证缓存。
 pub fn clear_credential_cache() {
-    if let Some(manager) = CREDENTIALS.get() {
-        let manager = manager.clone();
+    if let Some(manager) = active_credentials() {
         tauri::async_runtime::spawn(async move {
             manager.invalidate().await;
+        });
+    }
+}
+
+/// 在代理启动或开启注入后预热临时凭证，避免 CLI 并发首包时重复换取导致旧凭证失效。
+pub fn warm_credential_cache() {
+    if let Some(manager) = active_credentials() {
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = manager.get().await {
+                eprintln!("预热临时凭证失败: {error}");
+            }
         });
     }
 }
@@ -124,6 +155,8 @@ struct CredentialManager {
     app: tauri::AppHandle,
     fingerprint: String,
     cache: Mutex<Option<CachedCredential>>,
+    /// 合并并发刷新，避免多请求同时换取临时凭证导致先发出的凭证被作废。
+    refresh_lock: Mutex<()>,
 }
 
 impl CredentialManager {
@@ -132,6 +165,7 @@ impl CredentialManager {
             app,
             fingerprint,
             cache: Mutex::new(None),
+            refresh_lock: Mutex::new(()),
         }
     }
 
@@ -148,6 +182,18 @@ impl CredentialManager {
                 }
             }
         }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        {
+            let cache = self.cache.lock().await;
+            if let Some(cached) = cache.as_ref() {
+                if Instant::now() < cached.refresh_after {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
         self.refresh().await
     }
 
@@ -248,12 +294,16 @@ struct ProxyState {
 /// 启动本地拦截服务。CLI 仅配置指向本服务的 base_url；本服务换取临时凭证后
 /// 注入 `Authorization: Bearer bf-tmp-...` 与 `X-Device-Fingerprint` 再转发上游。
 pub fn start(app: tauri::AppHandle, fingerprint: String) -> Option<u16> {
-    start_on_port(app, fingerprint, 0)
+    let started = start_on_port(app, fingerprint, 0);
+    if started.is_some() {
+        warm_credential_cache();
+    }
+    started
 }
 
 fn start_on_port(app: tauri::AppHandle, fingerprint: String, port: u16) -> Option<u16> {
     let credentials = Arc::new(CredentialManager::new(app.clone(), fingerprint.clone()));
-    let _ = CREDENTIALS.set(credentials.clone());
+    register_credentials(credentials.clone());
 
     let state = Arc::new(ProxyState {
         app: app.clone(),
@@ -396,7 +446,7 @@ async fn forward_request(
     ];
 
     for (name, value) in parts.headers.iter() {
-        if SKIP_HEADERS.iter().any(|skip| skip == name) {
+        if SKIP_HEADERS.iter().any(|skip| skip == name) || name == X_API_KEY_HEADER {
             continue;
         }
         builder = builder.header(name, value);

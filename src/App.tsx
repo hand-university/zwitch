@@ -13,6 +13,7 @@ import {
   logout,
   onAuthChanged,
   onLoginFailed,
+  onProxyChanged,
   openLoginWindow,
   refreshUserProfile,
   scanLocalMarketplace,
@@ -188,9 +189,15 @@ export default function App() {
       void reportApiError(text, applyLoggedOut);
     });
 
+    const unlistenProxy = onProxyChanged((enabled) => {
+      setProxyEnabledState(enabled);
+      refreshTools().catch((e) => handleApiError(e));
+    });
+
     return () => {
       unlistenAuth.then((fn) => fn());
       unlistenFail.then((fn) => fn());
+      unlistenProxy.then((fn) => fn());
     };
   }, [refreshTools, applyLoggedOut, handleApiError]);
 

@@ -13,6 +13,9 @@ mod usage;
 mod usage_api;
 mod user_api;
 
+#[cfg(desktop)]
+mod tray;
+
 const SESSION_REFRESH_INTERVAL_SECS: u64 = 600;
 
 use auth::AuthState;
@@ -47,10 +50,17 @@ fn get_proxy_enabled(app: tauri::AppHandle) -> Result<bool, String> {
 
 #[tauri::command]
 async fn set_proxy_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    let mut settings = store::load_settings(&app)?;
-    settings.proxy_enabled = enabled;
-    store::save_settings(&app, &settings)?;
-    cli_tools::apply_config_injection_async(&app).await
+    #[cfg(desktop)]
+    {
+        return tray::set_proxy_enabled_internal(&app, enabled).await;
+    }
+    #[cfg(not(desktop))]
+    {
+        let mut settings = store::load_settings(&app)?;
+        settings.proxy_enabled = enabled;
+        store::save_settings(&app, &settings)?;
+        cli_tools::apply_config_injection_async(&app).await
+    }
 }
 
 #[tauri::command]
@@ -285,6 +295,9 @@ pub fn run() {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 app.deep_link().register_all()?;
             }
+
+            #[cfg(desktop)]
+            tray::setup(app.handle())?;
 
             Ok(())
         })

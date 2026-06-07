@@ -57,6 +57,12 @@ export function onLoginFailed(callback: (message: string) => void) {
   });
 }
 
+export function onProxyChanged(callback: (enabled: boolean) => void) {
+  return listen<boolean>("proxy-changed", (event) => {
+    callback(event.payload);
+  });
+}
+
 export async function getExploreItems(): Promise<ExploreItem[]> {
   return invoke("get_explore_items");
 }
