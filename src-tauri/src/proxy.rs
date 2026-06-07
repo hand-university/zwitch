@@ -1,5 +1,6 @@
 use crate::config::{DEVICE_FINGERPRINT_HEADER, LOCAL_PROXY_HOST};
 use crate::store::{load_auth, save_auth};
+use crate::usage::{self, Provider};
 use crate::user_api::exchange_device_code;
 use axum::{
     body::Body,
@@ -390,9 +391,51 @@ async fn forward_request(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("转发上游失败: {e}")))?;
 
-    build_upstream_response(upstream_resp)
+    let usage_ctx = Provider::from_tool_id(tool_id).map(|provider| UsageContext {
+        app: state.app.clone(),
+        provider,
+        model: usage::extract_model(provider, path, body_bytes),
+    });
+
+    build_upstream_response(upstream_resp, usage_ctx)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
+}
+
+/// 一次转发的用量采集上下文：仅在成功响应时旁路记录，绝不影响转发本身。
+struct UsageContext {
+    app: tauri::AppHandle,
+    provider: Provider,
+    model: String,
+}
+
+impl UsageContext {
+    /// 解析出 token 用量后计费并持久化（放到阻塞线程，避免拖慢响应）。
+    fn record(self, usage: crate::usage::TokenUsage) {
+        if usage.is_empty() {
+            return;
+        }
+        let cost = usage::cost_for(&self.model, &usage);
+        let app = self.app;
+        let model = self.model;
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(e) = crate::store::record_usage(&app, &model, &usage, cost) {
+                eprintln!("记录用量失败: {e}");
+            }
+        });
+    }
+
+    fn record_non_streaming(self, body: &[u8]) {
+        if let Some(usage) = usage::parse_usage(self.provider, body) {
+            self.record(usage);
+        }
+    }
+
+    fn record_streaming(self, body: &[u8]) {
+        if let Some(usage) = usage::parse_streaming_usage(self.provider, body) {
+            self.record(usage);
+        }
+    }
 }
 
 fn is_streaming_content_type(content_type: Option<&str>) -> bool {
@@ -405,7 +448,10 @@ fn is_streaming_content_type(content_type: Option<&str>) -> bool {
         || lower.contains("application/stream+json")
 }
 
-async fn build_upstream_response(upstream_resp: reqwest::Response) -> Result<Response, String> {
+async fn build_upstream_response(
+    upstream_resp: reqwest::Response,
+    usage_ctx: Option<UsageContext>,
+) -> Result<Response, String> {
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
     let content_type = resp_headers
@@ -420,10 +466,11 @@ async fn build_upstream_response(upstream_resp: reqwest::Response) -> Result<Res
         response = response.header(name, value);
     }
 
+    // 仅在成功响应时统计用量；失败响应没有有效 usage。
+    let usage_ctx = usage_ctx.filter(|_| status.is_success());
+
     if is_streaming_content_type(content_type) {
-        let stream = upstream_resp.bytes_stream().map(|chunk| {
-            chunk.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
-        });
+        let stream = tap_streaming(upstream_resp.bytes_stream(), usage_ctx);
         return response
             .body(Body::from_stream(stream))
             .map_err(|_| "构建流式响应失败".to_string());
@@ -434,9 +481,58 @@ async fn build_upstream_response(upstream_resp: reqwest::Response) -> Result<Res
         .await
         .map_err(|e| format!("读取上游响应失败: {e}"))?;
 
+    if let Some(ctx) = usage_ctx {
+        ctx.record_non_streaming(&bytes);
+    }
+
     response
         .body(Body::from(bytes))
         .map_err(|_| "构建响应失败".to_string())
+}
+
+/// 旁路累积流式分片：原样透传给 CLI，待流结束时解析用量。
+fn tap_streaming<S>(
+    inner: S,
+    usage_ctx: Option<UsageContext>,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    struct TapState<S> {
+        inner: S,
+        buffer: Vec<u8>,
+        usage_ctx: Option<UsageContext>,
+    }
+
+    let init = TapState {
+        inner,
+        buffer: Vec::new(),
+        usage_ctx,
+    };
+
+    futures_util::stream::unfold(init, |mut state| async move {
+        match state.inner.next().await {
+            Some(Ok(chunk)) => {
+                if state.usage_ctx.is_some() {
+                    state.buffer.extend_from_slice(&chunk);
+                }
+                let item: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                    Ok(chunk);
+                Some((item, state))
+            }
+            Some(Err(e)) => {
+                let item: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                    Err(Box::new(e));
+                Some((item, state))
+            }
+            None => {
+                if let Some(ctx) = state.usage_ctx.take() {
+                    ctx.record_streaming(&state.buffer);
+                }
+                None
+            }
+        }
+    })
 }
 
 fn error_response(status: StatusCode, message: String) -> Response {

@@ -2,13 +2,22 @@ import { AppIcon } from "@/components/ui/app-icon";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { AuthState, NavItem } from "@/types";
-import { Compass, Info, LogOut, Plug, Rocket, Sparkles } from "lucide-react";
+import {
+  BarChart3,
+  Compass,
+  Info,
+  LogOut,
+  Plug,
+  Rocket,
+  Sparkles,
+} from "lucide-react";
 
 const NAV_ICONS = {
   "quick-start": Rocket,
   explore: Compass,
   skills: Sparkles,
   plugins: Plug,
+  usage: BarChart3,
   about: Info,
 } as const;
 

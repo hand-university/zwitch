@@ -14,7 +14,40 @@ export interface CliToolStatus {
   install_url: string;
 }
 
-export type AppPage = "quick-start" | "explore" | "skills" | "plugins" | "about";
+export type AppPage =
+  | "quick-start"
+  | "explore"
+  | "skills"
+  | "plugins"
+  | "usage"
+  | "about";
+
+export interface UsageTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  requests: number;
+}
+
+export interface ModelUsage extends UsageTotals {
+  model: string;
+}
+
+export interface DailyUsage extends UsageTotals {
+  date: string;
+}
+
+export interface UsageSummary {
+  total: UsageTotals;
+  models: ModelUsage[];
+  calendar: DailyUsage[];
+  active_days: number;
+  first_recorded_at: string | null;
+  last_recorded_at: string | null;
+  today: string;
+}
 
 export interface AppInfo {
   name: string;
