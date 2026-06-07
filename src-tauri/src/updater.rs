@@ -9,6 +9,7 @@ use url::Url;
 
 const PENDING_UPDATE_FILE: &str = "pending-update.bin";
 const PENDING_UPDATE_VERSION_KEY: &str = "pending_update_version";
+const PENDING_UPDATE_NOTES_KEY: &str = "pending_update_notes";
 
 pub struct UpdateState(Mutex<InnerUpdateState>);
 
@@ -64,6 +65,7 @@ pub struct UpdateDownloadProgress {
 pub struct DownloadedUpdateInfo {
     pub ready: bool,
     pub version: Option<String>,
+    pub notes: Option<String>,
     pub deferred: bool,
 }
 
@@ -78,7 +80,12 @@ fn pending_update_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
-fn save_deferred_update(app: &AppHandle, bytes: &[u8], version: &str) -> Result<(), String> {
+fn save_deferred_update(
+    app: &AppHandle,
+    bytes: &[u8],
+    version: &str,
+    notes: Option<&str>,
+) -> Result<(), String> {
     let path = pending_update_path(app)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -90,6 +97,14 @@ fn save_deferred_update(app: &AppHandle, bytes: &[u8], version: &str) -> Result<
         PENDING_UPDATE_VERSION_KEY,
         serde_json::Value::String(version.to_string()),
     );
+    if let Some(notes) = notes.filter(|value| !value.is_empty()) {
+        store.set(
+            PENDING_UPDATE_NOTES_KEY,
+            serde_json::Value::String(notes.to_string()),
+        );
+    } else {
+        store.delete(PENDING_UPDATE_NOTES_KEY);
+    }
     store.save().map_err(|e| e.to_string())
 }
 
@@ -101,7 +116,15 @@ fn clear_deferred_update(app: &AppHandle) -> Result<(), String> {
 
     let store = store::get_store(app)?;
     store.delete(PENDING_UPDATE_VERSION_KEY);
+    store.delete(PENDING_UPDATE_NOTES_KEY);
     store.save().map_err(|e| e.to_string())
+}
+
+fn load_deferred_update_notes(app: &AppHandle) -> Result<Option<String>, String> {
+    let store = store::get_store(app)?;
+    Ok(store
+        .get(PENDING_UPDATE_NOTES_KEY)
+        .and_then(|value| value.as_str().map(str::to_string)))
 }
 
 fn load_deferred_update_version(app: &AppHandle) -> Result<Option<String>, String> {
@@ -180,9 +203,15 @@ pub fn get_downloaded_update_info(
             .as_ref()
             .map(|update| update.version.clone())
             .or_else(|| load_deferred_update_version(&app).ok().flatten());
+        let notes = inner
+            .pending
+            .as_ref()
+            .and_then(|update| update.body.clone())
+            .or_else(|| load_deferred_update_notes(&app).ok().flatten());
         return Ok(DownloadedUpdateInfo {
             ready: true,
             version,
+            notes,
             deferred: false,
         });
     }
@@ -191,6 +220,7 @@ pub fn get_downloaded_update_info(
         return Ok(DownloadedUpdateInfo {
             ready: true,
             version: Some(version),
+            notes: load_deferred_update_notes(&app)?,
             deferred: true,
         });
     }
@@ -198,6 +228,7 @@ pub fn get_downloaded_update_info(
     Ok(DownloadedUpdateInfo {
         ready: false,
         version: None,
+        notes: None,
         deferred: false,
     })
 }
@@ -311,21 +342,22 @@ pub async fn defer_downloaded_update(
     app: AppHandle,
     state: State<'_, UpdateState>,
 ) -> Result<(), String> {
-    let (bytes, version) = {
+    let (bytes, version, notes) = {
         let mut inner = state.0.lock().map_err(|e| e.to_string())?;
         let bytes = inner
             .downloaded_bytes
             .take()
             .ok_or_else(|| "没有已下载的更新".to_string())?;
-        let version = inner
+        let update = inner
             .pending
             .as_ref()
-            .map(|update| update.version.clone())
             .ok_or_else(|| "没有待安装的更新信息".to_string())?;
-        (bytes, version)
+        let version = update.version.clone();
+        let notes = update.body.clone();
+        (bytes, version, notes)
     };
 
-    save_deferred_update(&app, &bytes, &version)
+    save_deferred_update(&app, &bytes, &version, notes.as_deref())
 }
 
 pub async fn try_install_deferred_update(app: &AppHandle) {

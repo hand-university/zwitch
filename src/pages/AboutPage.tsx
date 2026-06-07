@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Download, Loader2, RefreshCw } from "lucide-react";
 import { AppIcon } from "@/components/ui/app-icon";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { UpdateChangelog } from "@/components/UpdateChangelog";
 import { UpdateDialog } from "@/components/UpdateDialog";
 import {
   checkForUpdate,
@@ -12,7 +13,8 @@ import {
 } from "@/lib/api";
 import { isDev } from "@/config/env";
 import { message } from "@/components/ui/message";
-import type { AppInfo, UpdateCheckResult } from "@/types";
+import type { AppInfo, DownloadedUpdateInfo, UpdateCheckResult } from "@/types";
+import { cn } from "@/lib/utils";
 
 type UpdateStatus =
   | "idle"
@@ -27,11 +29,61 @@ interface AboutPageProps {
   busy: boolean;
 }
 
+function mergeUpdateState(
+  check: UpdateCheckResult,
+  downloaded: DownloadedUpdateInfo,
+): { info: UpdateCheckResult; status: UpdateStatus } {
+  if (downloaded.ready && downloaded.version) {
+    return {
+      info: {
+        available: true,
+        currentVersion: check.currentVersion,
+        version: downloaded.version,
+        notes: check.notes ?? downloaded.notes,
+        date: check.date,
+      },
+      status: downloaded.deferred ? "deferred" : "ready",
+    };
+  }
+
+  if (check.available) {
+    return { info: check, status: "available" };
+  }
+
+  return { info: check, status: "up-to-date" };
+}
+
 export function AboutPage({ busy }: AboutPageProps) {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle");
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+
+  const refreshUpdateStatus = useCallback(async (silent = false) => {
+    if (isDev) return;
+    setUpdateStatus("checking");
+    try {
+      const [downloaded, check] = await Promise.all([
+        getDownloadedUpdateInfo(),
+        checkForUpdate(),
+      ]);
+      const { info, status } = mergeUpdateState(check, downloaded);
+      setUpdateInfo(info);
+      setUpdateStatus(status);
+      if (!silent) {
+        if (status === "available") {
+          message.info(`发现新版本 v${info.version}`);
+        } else if (status === "up-to-date") {
+          message.success("当前已是最新版本");
+        }
+      }
+    } catch (error) {
+      setUpdateStatus("idle");
+      if (!silent) {
+        message.error(String(error));
+      }
+    }
+  }, []);
 
   useEffect(() => {
     getAppInfo()
@@ -40,45 +92,11 @@ export function AboutPage({ busy }: AboutPageProps) {
   }, []);
 
   useEffect(() => {
-    if (isDev) return;
-    getDownloadedUpdateInfo()
-      .then((info) => {
-        if (!info.ready || !info.version) return;
-        if (info.deferred) {
-          setUpdateStatus("deferred");
-          setUpdateInfo((current) =>
-            current ?? {
-              available: true,
-              currentVersion: appInfo?.version ?? "",
-              version: info.version,
-              notes: null,
-              date: null,
-            },
-          );
-        } else {
-          setUpdateStatus("ready");
-        }
-      })
-      .catch(() => {});
-  }, [appInfo?.version]);
+    void refreshUpdateStatus(true);
+  }, [refreshUpdateStatus]);
 
-  const handleCheckUpdate = async () => {
-    setUpdateStatus("checking");
-    setUpdateInfo(null);
-    try {
-      const result = await checkForUpdate();
-      setUpdateInfo(result);
-      if (result.available) {
-        setUpdateStatus("available");
-        message.info(`发现新版本 v${result.version}`);
-      } else {
-        setUpdateStatus("up-to-date");
-        message.success("当前已是最新版本");
-      }
-    } catch (e) {
-      setUpdateStatus("idle");
-      message.error(String(e));
-    }
+  const handleCheckUpdate = () => {
+    void refreshUpdateStatus(false);
   };
 
   const handleDownloadUpdate = () => {
@@ -100,6 +118,10 @@ export function AboutPage({ busy }: AboutPageProps) {
   const canDownload = updateStatus === "available";
   const canRestart =
     updateStatus === "ready" || updateStatus === "deferred";
+  const hasNewVersion =
+    updateStatus === "available" ||
+    updateStatus === "ready" ||
+    updateStatus === "deferred";
 
   return (
     <>
@@ -122,8 +144,26 @@ export function AboutPage({ busy }: AboutPageProps) {
               <div className="flex items-center justify-between gap-4">
                 <span className="text-sm text-muted-foreground">版本</span>
                 <div className="flex flex-wrap items-center justify-end gap-2">
-                  <span className="text-sm font-medium">
-                    {appInfo ? `v${appInfo.version}` : "—"}
+                  <span className="inline-flex items-center gap-2 text-sm font-medium">
+                    <span className="relative inline-flex items-center">
+                      {appInfo ? `v${appInfo.version}` : "—"}
+                      {hasNewVersion ? (
+                        <span
+                          aria-label="有新版本"
+                          className="absolute -right-1.5 -top-1 h-2 w-2 rounded-full bg-primary ring-2 ring-background"
+                        />
+                      ) : null}
+                    </span>
+                    {hasNewVersion && updateInfo?.version ? (
+                      <span
+                        className={cn(
+                          "inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary",
+                          checking && "opacity-60",
+                        )}
+                      >
+                        新版本 v{updateInfo.version}
+                      </span>
+                    ) : null}
                   </span>
                   {!isDev ? (
                     <>
@@ -169,15 +209,16 @@ export function AboutPage({ busy }: AboutPageProps) {
                 </div>
               </div>
 
-              {updateStatus === "available" && updateInfo?.version ? (
-                <p className="mt-2 text-right text-xs text-muted-foreground">
-                  新版本 v{updateInfo.version} 可用
-                </p>
-              ) : null}
               {updateStatus === "deferred" && updateInfo?.version ? (
                 <p className="mt-2 text-right text-xs text-muted-foreground">
                   已下载 v{updateInfo.version}，将在下次启动时安装
                 </p>
+              ) : null}
+
+              {hasNewVersion && updateInfo?.notes ? (
+                <div className="mt-4">
+                  <UpdateChangelog notes={updateInfo.notes} />
+                </div>
               ) : null}
             </div>
           </Card>
@@ -189,15 +230,7 @@ export function AboutPage({ busy }: AboutPageProps) {
         updateInfo={updateInfo}
         onClose={() => {
           setDialogOpen(false);
-          void getDownloadedUpdateInfo()
-            .then((info) => {
-              if (info.ready && info.deferred) {
-                setUpdateStatus("deferred");
-              } else if (info.ready) {
-                setUpdateStatus("ready");
-              }
-            })
-            .catch(() => {});
+          void refreshUpdateStatus(true);
         }}
       />
     </>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Download, Loader2, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { UpdateChangelog } from "@/components/UpdateChangelog";
 import {
   deferDownloadedUpdate,
   downloadAvailableUpdate,
@@ -125,6 +126,12 @@ export function UpdateDialog({ open, updateInfo, onClose }: UpdateDialogProps) {
             </Button>
           ) : null}
         </div>
+
+        {updateInfo?.notes ? (
+          <div className="mt-4">
+            <UpdateChangelog notes={updateInfo.notes} compact />
+          </div>
+        ) : null}
 
         <div className="mt-5 space-y-3">
           {phase === "downloading" ? (

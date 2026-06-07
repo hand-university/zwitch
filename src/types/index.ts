@@ -71,6 +71,7 @@ export interface UpdateDownloadProgress {
 export interface DownloadedUpdateInfo {
   ready: boolean;
   version: string | null;
+  notes: string | null;
   deferred: boolean;
 }
 
