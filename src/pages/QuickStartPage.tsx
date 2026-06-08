@@ -1,10 +1,8 @@
-import { Check, ExternalLink, X, Zap } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { Check, Zap } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import type { CliToolStatus } from "@/types";
-import { open } from "@tauri-apps/plugin-shell";
 
 interface QuickStartPageProps {
   tools: CliToolStatus[];
@@ -19,7 +17,7 @@ export function QuickStartPage({
   proxyEnabled,
   onProxyToggle,
 }: QuickStartPageProps) {
-  const installedCount = tools.filter((tool) => tool.installed).length;
+  const supportedCount = tools.filter((tool) => tool.supported).length;
 
   return (
     <div className="p-6">
@@ -72,8 +70,8 @@ export function QuickStartPage({
               </div>
               <p className="text-sm leading-relaxed text-muted-foreground">
                 {proxyEnabled
-                  ? `正在为 ${installedCount} 个已安装工具自动配置代理`
-                  : "开启后自动配置所有已安装的工具，关闭则恢复原始设置"}
+                  ? `正在为 ${supportedCount} 个支持的 CLI 工具自动配置代理`
+                  : "开启后自动写入配置文件，关闭则恢复原始设置"}
               </p>
             </div>
 
@@ -94,26 +92,13 @@ export function QuickStartPage({
                 className="flex items-center justify-between gap-4 px-6 py-3.5"
               >
                 <span className="text-sm font-medium">{tool.name}</span>
-                {tool.installed ? (
+                {tool.supported ? (
                   <span className="inline-flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
                     <Check className="h-3.5 w-3.5" />
-                    已安装
+                    支持
                   </span>
                 ) : (
-                  <div className="flex items-center gap-3">
-                    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-                      <X className="h-3.5 w-3.5" />
-                      未安装
-                    </span>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => open(tool.install_url)}
-                    >
-                      <ExternalLink />
-                      安装
-                    </Button>
-                  </div>
+                  <span className="text-xs text-muted-foreground">暂不支持</span>
                 )}
               </div>
             ))}

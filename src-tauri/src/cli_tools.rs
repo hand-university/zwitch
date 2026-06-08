@@ -17,12 +17,10 @@ use tauri::AppHandle;
 pub struct CliToolStatus {
     pub id: String,
     pub name: String,
-    pub installed: bool,
-    pub binary: Option<String>,
+    pub supported: bool,
     pub config_path: String,
     pub base_url_field: String,
     pub token_field: String,
-    pub install_url: String,
 }
 
 enum ConfigFormat {
@@ -140,8 +138,8 @@ pub fn tool_ids() -> Vec<&'static str> {
     TOOLS.iter().map(|tool| tool.id).collect()
 }
 
-fn tool_should_inject(settings: &StoredSettings, tool: &ToolDefinition) -> bool {
-    settings.proxy_enabled && find_binary(tool.binaries).is_some()
+fn tool_should_inject(settings: &StoredSettings, _tool: &ToolDefinition) -> bool {
+    settings.proxy_enabled
 }
 
 pub fn get_cli_tools_status(_app: &AppHandle) -> Result<Vec<CliToolStatus>, String> {
@@ -150,17 +148,14 @@ pub fn get_cli_tools_status(_app: &AppHandle) -> Result<Vec<CliToolStatus>, Stri
     Ok(TOOLS
         .iter()
         .map(|tool| {
-            let binary = find_binary(tool.binaries);
             let config_path = home.join(tool.targets[0].relative);
             CliToolStatus {
                 id: tool.id.to_string(),
                 name: tool.name.to_string(),
-                installed: binary.is_some(),
-                binary,
+                supported: true,
                 config_path: config_path.to_string_lossy().to_string(),
                 base_url_field: tool.base_url_field.to_string(),
                 token_field: tool.token_field.to_string(),
-                install_url: tool.install_url.to_string(),
             }
         })
         .collect())
@@ -202,7 +197,6 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
 
     for tool in TOOLS {
         let tool_enabled = tool_should_inject(&settings, tool);
-        let installed = find_binary(tool.binaries).is_some();
         let local_base = if proxy_port != 0 {
             crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
         } else {
@@ -220,10 +214,6 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
                 if restore_config(app, &mut backup, tool, target, &config_path)? {
                     backup_dirty = true;
                 }
-                continue;
-            }
-
-            if !installed {
                 continue;
             }
 
@@ -457,6 +447,44 @@ fn resolve_field_value(spec: &FieldSpec, base_url: &str) -> String {
     }
 }
 
+fn backup_absent_fields(
+    backup: &mut crate::store::ConfigBackup,
+    tool: &ToolDefinition,
+    target: &ConfigTarget,
+    config_path: &Path,
+) {
+    let file_key = config_path.to_string_lossy().to_string();
+    let entry = backup.files.entry(file_key).or_default();
+
+    match target.format {
+        ConfigFormat::Json => {
+            for field in target.fields {
+                entry
+                    .entry(backup_key(tool.id, field.path))
+                    .or_insert_with(|| BACKUP_ABSENT.to_string());
+            }
+        }
+        ConfigFormat::Toml => {}
+        ConfigFormat::CodexProviderToml => {
+            for field in codex_config_fields() {
+                if *field == "snapshot" {
+                    continue;
+                }
+                entry
+                    .entry(backup_key(tool.id, field))
+                    .or_insert_with(|| BACKUP_ABSENT.to_string());
+            }
+        }
+        ConfigFormat::DotEnv => {
+            for field in target.fields {
+                entry
+                    .entry(backup_key(tool.id, field.path))
+                    .or_insert_with(|| BACKUP_ABSENT.to_string());
+            }
+        }
+    }
+}
+
 fn backup_current_values(
     backup: &mut crate::store::ConfigBackup,
     tool: &ToolDefinition,
@@ -464,6 +492,7 @@ fn backup_current_values(
     config_path: &Path,
 ) -> Result<(), String> {
     if !config_path.exists() {
+        backup_absent_fields(backup, tool, target, config_path);
         return Ok(());
     }
 

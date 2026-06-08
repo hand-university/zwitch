@@ -10,8 +10,7 @@ export interface AuthState {
 export interface CliToolStatus {
   id: string;
   name: string;
-  installed: boolean;
-  install_url: string;
+  supported: boolean;
 }
 
 export type AppPage =
