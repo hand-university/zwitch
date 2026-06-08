@@ -47,6 +47,35 @@ npm install
 npm run tauri dev
 ```
 
+## 本地打 AUR 包
+
+脚本会读取 GitHub 最新 release 中的 Linux `.deb` 产物，生成 `PKGBUILD` / `.SRCINFO`，并用 `makepkg` 打出本地 Arch 包：
+
+```bash
+scripts/build-aur-package.sh
+```
+
+直接打包并安装：
+
+```bash
+scripts/install-aur-package.sh
+```
+
+生成产物默认在 `build/aur/zwitch-bin/`，例如：
+
+```bash
+sudo pacman -U build/aur/zwitch-bin/zwitch-bin-*-x86_64.pkg.tar.zst
+```
+
+常用参数：
+
+```bash
+scripts/build-aur-package.sh --version 0.1.5
+scripts/build-aur-package.sh --install
+scripts/install-aur-package.sh --version 0.1.5
+scripts/build-aur-package.sh --no-build
+```
+
 ## 配置说明
 
 地址与 Deep Link scheme 写死在以下文件中，按需直接修改：

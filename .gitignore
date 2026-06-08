@@ -9,6 +9,7 @@ node_modules
 # Build
 dist
 dist-ssr
+build/aur/
 *.local
 
 # Editor
