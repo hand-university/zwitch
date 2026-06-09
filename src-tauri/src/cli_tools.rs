@@ -1089,6 +1089,27 @@ fn bifrost_provider_for_pi_models(models: &[GrayscaleModelEntry]) -> String {
         .to_string()
 }
 
+fn pi_model_display_name(model: &GrayscaleModelEntry) -> String {
+    if model.key_name.is_empty() {
+        format!("{} [灰度]", model.id)
+    } else {
+        format!("{} [灰度]", model.key_name)
+    }
+}
+
+fn build_pi_model_entry(model: &GrayscaleModelEntry) -> Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert("id".into(), Value::String(model.id.clone()));
+    entry.insert("name".into(), Value::String(pi_model_display_name(model)));
+    if let Some(context_window) = model.context_window {
+        entry.insert("contextWindow".into(), Value::Number(context_window.into()));
+    }
+    if let Some(max_tokens) = model.max_tokens {
+        entry.insert("maxTokens".into(), Value::Number(max_tokens.into()));
+    }
+    Value::Object(entry)
+}
+
 fn build_pi_providers_config(
     local_proxy_base: &str,
     platform: &GrayscalePlatformModels,
@@ -1102,20 +1123,7 @@ fn build_pi_providers_config(
         let base_path = resolve_pi_provider_base_path(&bifrost_provider, &models, platform);
         let api = resolve_pi_provider_api(&base_path, &models);
         let base_url = build_pi_provider_base_url(local_proxy_base, &base_path);
-        let model_entries: Vec<Value> = models
-            .iter()
-            .map(|model| {
-                let display_name = if model.key_name.is_empty() {
-                    format!("{} [灰度]", model.id)
-                } else {
-                    format!("{} [灰度]", model.key_name)
-                };
-                serde_json::json!({
-                    "id": model.id,
-                    "name": display_name,
-                })
-            })
-            .collect();
+        let model_entries: Vec<Value> = models.iter().map(build_pi_model_entry).collect();
 
         providers.insert(
             provider_key.clone(),
@@ -2386,6 +2394,8 @@ base_url = "http://old.example/codex"
             source: "grayscale".into(),
             api: None,
             base_path: None,
+            context_window: None,
+            max_tokens: None,
         }];
         inject_claude_grayscale_models(&mut value, &models);
         let env = value.get("env").unwrap().as_object().unwrap();
@@ -2435,6 +2445,8 @@ base_url = "http://old.example/codex"
             source: "grayscale".into(),
             api: None,
             base_path: None,
+            context_window: None,
+            max_tokens: None,
         }];
         assert_eq!(pi_provider_key_from_models(&models), "灰度 Mythos");
     }
@@ -2450,6 +2462,8 @@ base_url = "http://old.example/codex"
                 source: "grayscale".into(),
                 api: Some("openai-responses".into()),
                 base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
             },
             GrayscaleModelEntry {
                 id: "claude-mythos-preview-fast".into(),
@@ -2459,6 +2473,8 @@ base_url = "http://old.example/codex"
                 source: "grayscale".into(),
                 api: Some("openai-responses".into()),
                 base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
             },
         ]);
 
@@ -2484,6 +2500,77 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
+    fn pi_includes_context_window_from_grayscale_api() {
+        let platform = pi_test_platform(vec![GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "claude".into(),
+            key_id: "gray-claude-key".into(),
+            key_name: "灰度 Claude".into(),
+            source: "grayscale".into(),
+            api: Some("openai-responses".into()),
+            base_path: Some("/openai".into()),
+            context_window: Some(200_000),
+            max_tokens: Some(8_192),
+        }]);
+
+        let (providers, _) =
+            build_pi_providers_config("http://127.0.0.1:51805/pi", &platform);
+        let model = providers
+            .as_object()
+            .unwrap()
+            .get("灰度 Claude")
+            .unwrap()
+            .get("models")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        assert_eq!(
+            model.get("contextWindow").and_then(Value::as_u64),
+            Some(200_000)
+        );
+        assert_eq!(model.get("maxTokens").and_then(Value::as_u64), Some(8_192));
+    }
+
+    #[test]
+    fn pi_omits_context_window_when_api_missing() {
+        let platform = pi_test_platform(vec![GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "claude".into(),
+            key_id: "gray-claude-key".into(),
+            key_name: "灰度 Claude".into(),
+            source: "grayscale".into(),
+            api: Some("openai-responses".into()),
+            base_path: Some("/openai".into()),
+            context_window: None,
+            max_tokens: None,
+        }]);
+
+        let (providers, _) =
+            build_pi_providers_config("http://127.0.0.1:51805/pi", &platform);
+        let model = providers
+            .as_object()
+            .unwrap()
+            .get("灰度 Claude")
+            .unwrap()
+            .get("models")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .first()
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        assert!(!model.contains_key("contextWindow"));
+        assert!(!model.contains_key("maxTokens"));
+    }
+
+    #[test]
     fn pi_restore_removes_injected_providers() {
         let original = r#"{"providers":{"local":{"api":"openai-completions"}}}"#;
         let (providers, _) = build_pi_providers_config(
@@ -2496,6 +2583,8 @@ base_url = "http://old.example/codex"
                 source: "grayscale".into(),
                 api: Some("openai-responses".into()),
                 base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
             }]),
         );
         let mut value: Value = serde_json::from_str(original).unwrap();

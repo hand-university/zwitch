@@ -45,6 +45,22 @@ pub struct GrayscaleModelEntry {
     /// 网关转发前缀（如 `/openai`），自定义 Provider 由后端返回。
     #[serde(default)]
     pub base_path: Option<String>,
+    /// 模型上下文窗口（token 数），供 Pi 等客户端写入 `contextWindow`。
+    #[serde(
+        default,
+        alias = "contextWindow",
+        alias = "context_length",
+        alias = "contextLength"
+    )]
+    pub context_window: Option<u64>,
+    /// 模型最大输出 token 数，供 Pi 等客户端写入 `maxTokens`。
+    #[serde(
+        default,
+        alias = "maxTokens",
+        alias = "max_output_tokens",
+        alias = "maxOutputTokens"
+    )]
+    pub max_tokens: Option<u64>,
 }
 
 impl GrayscalePlatformModels {
@@ -354,6 +370,8 @@ fn test_grayscale_model(id: &str, provider: &str) -> GrayscaleModelEntry {
         source: "grayscale".into(),
         api: None,
         base_path: None,
+        context_window: None,
+        max_tokens: None,
     }
 }
 
@@ -463,6 +481,31 @@ mod tests {
 
         let platform = resolve_pi_grayscale_platform(&response).unwrap();
         assert_eq!(platform.additional_models[0].id, "from-pi");
+    }
+
+    #[test]
+    fn parses_grayscale_model_context_metadata() {
+        let raw = r#"{
+            "id": "claude-mythos-preview",
+            "provider": "claude",
+            "source": "grayscale",
+            "context_window": 200000,
+            "max_tokens": 8192
+        }"#;
+        let model: GrayscaleModelEntry = serde_json::from_str(raw).unwrap();
+        assert_eq!(model.context_window, Some(200_000));
+        assert_eq!(model.max_tokens, Some(8_192));
+
+        let camel: GrayscaleModelEntry = serde_json::from_str(
+            r#"{
+                "id": "claude-mythos-preview",
+                "contextWindow": 1000000,
+                "maxOutputTokens": 16384
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(camel.context_window, Some(1_000_000));
+        assert_eq!(camel.max_tokens, Some(16_384));
     }
 
     #[test]
