@@ -1,6 +1,6 @@
 [package]
 name = "zwitch"
-version = "0.1.5"
+version = "0.1.6"
 description = "ZWitch - AI CLI proxy configuration tool"
 authors = ["zhangqiang"]
 edition = "2021"
