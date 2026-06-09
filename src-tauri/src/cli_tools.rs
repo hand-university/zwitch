@@ -1015,6 +1015,31 @@ fn resolve_pi_provider_api(base_path: &str, models: &[GrayscaleModelEntry]) -> S
         .unwrap_or_else(|| infer_pi_api_from_base_path(base_path).to_string())
 }
 
+fn build_pi_model_entry(model: &GrayscaleModelEntry) -> Value {
+    let display_name = if model.key_name.is_empty() {
+        format!("{} [灰度]", model.id)
+    } else {
+        format!("{} [灰度]", model.key_name)
+    };
+
+    let mut entry = serde_json::Map::new();
+    entry.insert("id".to_string(), Value::String(model.id.clone()));
+    entry.insert("name".to_string(), Value::String(display_name));
+    if let Some(context_window) = model.context_window.filter(|value| *value > 0) {
+        entry.insert(
+            "contextWindow".to_string(),
+            Value::Number(context_window.into()),
+        );
+    }
+    if let Some(max_tokens) = model.max_tokens.filter(|value| *value > 0) {
+        entry.insert(
+            "maxTokens".to_string(),
+            Value::Number(max_tokens.into()),
+        );
+    }
+    Value::Object(entry)
+}
+
 fn build_pi_provider_base_url(local_proxy_base: &str, base_path: &str) -> String {
     let local_proxy_base = local_proxy_base.trim_end_matches('/');
     let base_path = normalize_pi_base_path(base_path);
@@ -1102,20 +1127,7 @@ fn build_pi_providers_config(
         let base_path = resolve_pi_provider_base_path(&bifrost_provider, &models, platform);
         let api = resolve_pi_provider_api(&base_path, &models);
         let base_url = build_pi_provider_base_url(local_proxy_base, &base_path);
-        let model_entries: Vec<Value> = models
-            .iter()
-            .map(|model| {
-                let display_name = if model.key_name.is_empty() {
-                    format!("{} [灰度]", model.id)
-                } else {
-                    format!("{} [灰度]", model.key_name)
-                };
-                serde_json::json!({
-                    "id": model.id,
-                    "name": display_name,
-                })
-            })
-            .collect();
+        let model_entries: Vec<Value> = models.iter().map(build_pi_model_entry).collect();
 
         providers.insert(
             provider_key.clone(),
@@ -2386,6 +2398,8 @@ base_url = "http://old.example/codex"
             source: "grayscale".into(),
             api: None,
             base_path: None,
+            context_window: None,
+            max_tokens: None,
         }];
         inject_claude_grayscale_models(&mut value, &models);
         let env = value.get("env").unwrap().as_object().unwrap();
@@ -2435,6 +2449,8 @@ base_url = "http://old.example/codex"
             source: "grayscale".into(),
             api: None,
             base_path: None,
+            context_window: None,
+            max_tokens: None,
         }];
         assert_eq!(pi_provider_key_from_models(&models), "灰度 Mythos");
     }
@@ -2450,6 +2466,8 @@ base_url = "http://old.example/codex"
                 source: "grayscale".into(),
                 api: Some("openai-responses".into()),
                 base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
             },
             GrayscaleModelEntry {
                 id: "claude-mythos-preview-fast".into(),
@@ -2459,6 +2477,8 @@ base_url = "http://old.example/codex"
                 source: "grayscale".into(),
                 api: Some("openai-responses".into()),
                 base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
             },
         ]);
 
@@ -2484,6 +2504,48 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
+    fn pi_model_entry_uses_api_context_window_not_hardcoded_default() {
+        let entry = build_pi_model_entry(&GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "claude".into(),
+            key_id: "gray-claude-key".into(),
+            key_name: "灰度 Claude".into(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+            context_window: Some(200_000),
+            max_tokens: Some(32_000),
+        });
+        let object = entry.as_object().unwrap();
+        assert_eq!(
+            object.get("contextWindow").and_then(Value::as_u64),
+            Some(200_000)
+        );
+        assert_eq!(
+            object.get("maxTokens").and_then(Value::as_u64),
+            Some(32_000)
+        );
+    }
+
+    #[test]
+    fn pi_model_entry_omits_context_window_when_api_missing() {
+        let entry = build_pi_model_entry(&GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "claude".into(),
+            key_id: String::new(),
+            key_name: String::new(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+            context_window: None,
+            max_tokens: None,
+        });
+        let object = entry.as_object().unwrap();
+        assert!(!object.contains_key("contextWindow"));
+        assert!(!object.contains_key("maxTokens"));
+    }
+
+    #[test]
     fn pi_restore_removes_injected_providers() {
         let original = r#"{"providers":{"local":{"api":"openai-completions"}}}"#;
         let (providers, _) = build_pi_providers_config(
@@ -2496,6 +2558,8 @@ base_url = "http://old.example/codex"
                 source: "grayscale".into(),
                 api: Some("openai-responses".into()),
                 base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
             }]),
         );
         let mut value: Value = serde_json::from_str(original).unwrap();
