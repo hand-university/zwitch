@@ -39,16 +39,16 @@ pub struct GrayscaleModelEntry {
     pub key_name: String,
     #[serde(default)]
     pub source: String,
-    /// Pi 等客户端使用的 API 类型（如 `openai-responses`）。
+    /// OpenCode 等客户端使用的 API 类型（如 `openai-responses`）。
     #[serde(default)]
     pub api: Option<String>,
     /// 网关转发前缀（如 `/openai`），自定义 Provider 由后端返回。
     #[serde(default)]
     pub base_path: Option<String>,
-    /// 模型上下文窗口大小（tokens），Pi Agent 写入 `contextWindow`。
+    /// 模型上下文窗口大小（tokens），OpenCode 写入 `limit.context`。
     #[serde(default, alias = "contextWindow")]
     pub context_window: Option<u64>,
-    /// 模型最大输出 token 数，Pi Agent 写入 `maxTokens`。
+    /// 模型最大输出 token 数，OpenCode 写入 `limit.output`。
     #[serde(default, alias = "maxTokens")]
     pub max_tokens: Option<u64>,
 }
@@ -252,8 +252,8 @@ fn is_builtin_bifrost_provider(provider: &str) -> bool {
     )
 }
 
-/// 判断灰度模型是否应注入 Pi（自定义 Provider 或携带 Pi 注入元数据）。
-pub fn is_pi_grayscale_model(model: &GrayscaleModelEntry) -> bool {
+/// 判断灰度模型是否应注入 OpenCode（自定义 Provider 或携带 OpenCode 注入元数据）。
+pub fn is_opencode_grayscale_model(model: &GrayscaleModelEntry) -> bool {
     if model.api.is_some() || model.base_path.is_some() {
         return true;
     }
@@ -261,12 +261,14 @@ pub fn is_pi_grayscale_model(model: &GrayscaleModelEntry) -> bool {
     !provider.is_empty() && !is_builtin_bifrost_provider(provider)
 }
 
-fn collect_pi_metadata_models(response: &GrayscaleModelsResponse) -> Vec<GrayscaleModelEntry> {
+fn collect_opencode_metadata_models(
+    response: &GrayscaleModelsResponse,
+) -> Vec<GrayscaleModelEntry> {
     let mut seen = HashSet::new();
     let mut models = Vec::new();
     for platform in &response.platforms {
         for model in &platform.additional_models {
-            if !is_pi_grayscale_model(model) {
+            if !is_opencode_grayscale_model(model) {
                 continue;
             }
             if seen.insert(model.id.clone()) {
@@ -277,14 +279,14 @@ fn collect_pi_metadata_models(response: &GrayscaleModelsResponse) -> Vec<Graysca
     models
 }
 
-fn synthesize_pi_platform(
+fn synthesize_opencode_platform(
     response: &GrayscaleModelsResponse,
     additional_models: Vec<GrayscaleModelEntry>,
     base_path: String,
 ) -> GrayscalePlatformModels {
     GrayscalePlatformModels {
-        id: "pi".into(),
-        label: "Pi".into(),
+        id: "opencode".into(),
+        label: "OpenCode".into(),
         base_path,
         injection_mode: response.injection_mode.clone(),
         models: vec![],
@@ -292,31 +294,31 @@ fn synthesize_pi_platform(
     }
 }
 
-/// 解析 Pi 应注入的灰度模型平台数据。
+/// 解析 OpenCode 应注入的灰度模型平台数据。
 ///
-/// 优先使用 `platform=pi`；若后端将自定义 OpenAI 兼容 Provider 挂在 codex/opencode 平台，
+/// 优先使用 `platform=opencode`；若后端将自定义 OpenAI 兼容 Provider 挂在 codex 平台，
 /// 则回退收集非内置 Provider 的灰度模型。
-pub fn resolve_pi_grayscale_platform(
+pub fn resolve_opencode_grayscale_platform(
     response: &GrayscaleModelsResponse,
 ) -> Option<GrayscalePlatformModels> {
-    if let Some(platform) = find_platform_models(response, "pi") {
+    if let Some(platform) = find_platform_models(response, "opencode") {
         if !platform.additional_models.is_empty() {
             return Some(platform.clone());
         }
     }
 
-    for platform_id in ["codex", "opencode"] {
+    for platform_id in ["codex"] {
         let Some(platform) = find_platform_models(response, platform_id) else {
             continue;
         };
         let custom_models: Vec<_> = platform
             .additional_models
             .iter()
-            .filter(|model| is_pi_grayscale_model(model))
+            .filter(|model| is_opencode_grayscale_model(model))
             .cloned()
             .collect();
         if !custom_models.is_empty() {
-            return Some(synthesize_pi_platform(
+            return Some(synthesize_opencode_platform(
                 response,
                 custom_models,
                 platform.base_path.clone(),
@@ -324,7 +326,7 @@ pub fn resolve_pi_grayscale_platform(
         }
     }
 
-    let metadata_models = collect_pi_metadata_models(response);
+    let metadata_models = collect_opencode_metadata_models(response);
     if metadata_models.is_empty() {
         return None;
     }
@@ -332,21 +334,29 @@ pub fn resolve_pi_grayscale_platform(
     let base_path = metadata_models
         .iter()
         .find_map(|model| model.base_path.clone())
-        .or_else(|| find_platform_models(response, "pi").map(|platform| platform.base_path.clone()))
+        .or_else(|| {
+            find_platform_models(response, "opencode").map(|platform| platform.base_path.clone())
+        })
         .unwrap_or_else(|| "/openai".to_string());
 
-    Some(synthesize_pi_platform(response, metadata_models, base_path))
+    Some(synthesize_opencode_platform(
+        response,
+        metadata_models,
+        base_path,
+    ))
 }
 
-pub fn merge_pi_platform_response(
+pub fn merge_opencode_platform_response(
     mut response: GrayscaleModelsResponse,
-    pi_only: GrayscaleModelsResponse,
+    opencode_only: GrayscaleModelsResponse,
 ) -> GrayscaleModelsResponse {
-    let Some(pi_platform) = find_platform_models(&pi_only, "pi") else {
+    let Some(opencode_platform) = find_platform_models(&opencode_only, "opencode") else {
         return response;
     };
-    response.platforms.retain(|platform| platform.id != "pi");
-    response.platforms.push(pi_platform.clone());
+    response
+        .platforms
+        .retain(|platform| platform.id != "opencode");
+    response.platforms.push(opencode_platform.clone());
     response
 }
 
@@ -417,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pi_platform_from_codex_custom_provider() {
+    fn resolve_opencode_platform_from_codex_custom_provider() {
         let response: GrayscaleModelsResponse = serde_json::from_str(
             r#"{
             "injection_mode": "append",
@@ -434,15 +444,15 @@ mod tests {
         )
         .unwrap();
 
-        let platform = resolve_pi_grayscale_platform(&response).unwrap();
-        assert_eq!(platform.id, "pi");
+        let platform = resolve_opencode_grayscale_platform(&response).unwrap();
+        assert_eq!(platform.id, "opencode");
         assert_eq!(platform.base_path, "/openai");
         assert_eq!(platform.additional_models.len(), 1);
         assert_eq!(platform.additional_models[0].provider, "claude");
     }
 
     #[test]
-    fn resolve_pi_prefers_dedicated_platform() {
+    fn resolve_opencode_prefers_dedicated_platform() {
         let response: GrayscaleModelsResponse = serde_json::from_str(
             r#"{
             "platforms": [
@@ -456,10 +466,10 @@ mod tests {
                     }]
                 },
                 {
-                    "id": "pi",
+                    "id": "opencode",
                     "base_path": "/openai",
                     "additional_models": [{
-                        "id": "from-pi",
+                        "id": "from-opencode",
                         "provider": "claude",
                         "source": "grayscale"
                     }]
@@ -469,15 +479,15 @@ mod tests {
         )
         .unwrap();
 
-        let platform = resolve_pi_grayscale_platform(&response).unwrap();
-        assert_eq!(platform.additional_models[0].id, "from-pi");
+        let platform = resolve_opencode_grayscale_platform(&response).unwrap();
+        assert_eq!(platform.additional_models[0].id, "from-opencode");
     }
 
     #[test]
-    fn parses_pi_model_context_metadata() {
+    fn parses_opencode_model_context_metadata() {
         let raw = r#"{
             "platforms": [{
-                "id": "pi",
+                "id": "opencode",
                 "additional_models": [{
                     "id": "claude-mythos-preview",
                     "provider": "claude",
@@ -488,16 +498,18 @@ mod tests {
             }]
         }"#;
         let parsed: GrayscaleModelsResponse = serde_json::from_str(raw).unwrap();
-        let model = &find_platform_models(&parsed, "pi").unwrap().additional_models[0];
+        let model = &find_platform_models(&parsed, "opencode")
+            .unwrap()
+            .additional_models[0];
         assert_eq!(model.context_window, Some(200_000));
         assert_eq!(model.max_tokens, Some(32_000));
     }
 
     #[test]
-    fn parses_pi_custom_provider_metadata() {
+    fn parses_opencode_custom_provider_metadata() {
         let raw = r#"{
             "platforms": [{
-                "id": "pi",
+                "id": "opencode",
                 "base_path": "/openai",
                 "additional_models": [{
                     "id": "claude-mythos-preview",
@@ -509,7 +521,7 @@ mod tests {
             }]
         }"#;
         let parsed: GrayscaleModelsResponse = serde_json::from_str(raw).unwrap();
-        let platform = find_platform_models(&parsed, "pi").unwrap();
+        let platform = find_platform_models(&parsed, "opencode").unwrap();
         let model = &platform.additional_models[0];
         assert_eq!(model.provider, "claude");
         assert_eq!(model.api.as_deref(), Some("openai-responses"));
