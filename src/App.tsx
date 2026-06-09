@@ -18,6 +18,7 @@ import {
   refreshUserProfile,
   scanLocalMarketplace,
   setMarketplaceItemEnabled,
+  setCliToolConfigEnabled,
   setProxyEnabled,
   syncMarketplace,
 } from "@/lib/api";
@@ -244,6 +245,18 @@ export default function App() {
     }
   };
 
+  const handleToolConfigToggle = async (toolId: string, enabled: boolean) => {
+    setBusy(true);
+    try {
+      await setCliToolConfigEnabled(toolId, enabled);
+      await refreshTools();
+    } catch (e) {
+      await handleApiError(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleMarketplaceSync = async () => {
     setBusy(true);
     try {
@@ -385,6 +398,7 @@ export default function App() {
               busy={busy}
               proxyEnabled={proxyEnabled}
               onProxyToggle={handleProxyToggle}
+              onToolConfigToggle={handleToolConfigToggle}
             />
           ) : null}
           {activePage === "explore" ? (

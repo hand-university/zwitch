@@ -65,21 +65,22 @@ pub async fn resolve_aone_session_token_for_api(app: &AppHandle) -> Result<Strin
 }
 
 fn disable_proxy_and_restore_configs(app: &AppHandle) -> Result<(), String> {
-    let mut settings = load_settings(app)?;
-    if settings.proxy_enabled {
-        settings.proxy_enabled = false;
-        save_settings(app, &settings)?;
-    }
-    crate::cli_tools::apply_config_injection(app)
+    tauri::async_runtime::block_on(disable_proxy_and_restore_configs_async(app))
 }
 
 async fn disable_proxy_and_restore_configs_async(app: &AppHandle) -> Result<(), String> {
-    let mut settings = load_settings(app)?;
-    if settings.proxy_enabled {
+    #[cfg(desktop)]
+    {
+        return crate::tray::set_proxy_enabled_internal(app, false).await;
+    }
+    #[cfg(not(desktop))]
+    {
+        let mut settings = load_settings(app)?;
         settings.proxy_enabled = false;
         save_settings(app, &settings)?;
+        crate::cli_tools::apply_config_injection_async(app).await?;
+        Ok(())
     }
-    crate::cli_tools::apply_config_injection_async(app).await
 }
 
 async fn clear_logged_in_state_async(app: &AppHandle) -> Result<AuthState, String> {

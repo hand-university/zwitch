@@ -8,6 +8,8 @@ commands.allow = [
   "refresh_user_profile",
   "get_cli_tools_status",
   "get_proxy_enabled",
+  "open_external_url",
+  "set_cli_tool_config_enabled",
   "set_proxy_enabled",
   "apply_config_injection",
   "get_explore_items",

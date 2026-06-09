@@ -41,6 +41,17 @@ export async function setProxyEnabled(enabled: boolean): Promise<void> {
   return invoke("set_proxy_enabled", { enabled });
 }
 
+export async function openExternalUrl(url: string): Promise<void> {
+  return invoke("open_external_url", { url });
+}
+
+export async function setCliToolConfigEnabled(
+  toolId: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke("set_cli_tool_config_enabled", { toolId, enabled });
+}
+
 export async function applyConfigInjection(): Promise<void> {
   return invoke("apply_config_injection");
 }

@@ -1,5 +1,5 @@
 use tauri::{
-    menu::{CheckMenuItem, Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
     AppHandle, Emitter, Manager, Runtime,
 };
@@ -7,6 +7,7 @@ use tauri::{
 const TRAY_ID: &str = "main-tray";
 const MENU_SHOW: &str = "show_main";
 const MENU_PROXY: &str = "toggle_proxy";
+const MENU_QUIT: &str = "quit_app";
 
 pub struct TrayState<R: Runtime> {
     proxy_item: CheckMenuItem<R>,
@@ -58,7 +59,11 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let menu = Menu::with_items(app, &[&show_main, &proxy_item])
+    let separator = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
+    let quit_item = MenuItem::with_id(app, MENU_QUIT, "退出", true, None::<&str>)
+        .map_err(|e| e.to_string())?;
+
+    let menu = Menu::with_items(app, &[&show_main, &proxy_item, &separator, &quit_item])
         .map_err(|e| e.to_string())?;
 
     let proxy_for_state = proxy_item.clone();
@@ -89,6 +94,9 @@ pub fn setup(app: &AppHandle) -> Result<(), String> {
                         }
                     }
                 });
+            }
+            MENU_QUIT => {
+                app.exit(0);
             }
             _ => {}
         })

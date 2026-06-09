@@ -75,10 +75,10 @@ pub struct StoredAuth {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StoredSettings {
-    /// 功能总开关：开启时为所有已安装工具注入配置，关闭时还原全部配置。
+    /// 功能总开关：开启时为已启用的工具注入配置，关闭时还原全部配置。
     #[serde(default)]
     pub proxy_enabled: bool,
-    /// 历史字段，已不再使用。
+    /// 各 CLI 配置注入开关，缺省或 `true` 表示开启。
     #[serde(default)]
     pub tool_switches: HashMap<String, bool>,
 }

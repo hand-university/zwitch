@@ -20,6 +20,7 @@ const SESSION_REFRESH_INTERVAL_SECS: u64 = 600;
 
 use auth::AuthState;
 use cli_tools::CliToolStatus;
+use tauri_plugin_opener::OpenerExt;
 use marketplace::{ExploreItemView, MarketplaceItemView, MarketplaceSyncResult};
 use updater::{AppInfo, DownloadedUpdateInfo, UpdateCheckResult, UpdateState};
 
@@ -39,13 +40,29 @@ fn logout(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_cli_tools_status(app: tauri::AppHandle) -> Result<Vec<CliToolStatus>, String> {
-    cli_tools::get_cli_tools_status(&app)
+async fn get_cli_tools_status(app: tauri::AppHandle) -> Result<Vec<CliToolStatus>, String> {
+    cli_tools::get_cli_tools_status_async(&app).await
 }
 
 #[tauri::command]
 fn get_proxy_enabled(app: tauri::AppHandle) -> Result<bool, String> {
     Ok(store::load_settings(&app)?.proxy_enabled)
+}
+
+#[tauri::command]
+fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| format!("无法打开链接: {e}"))
+}
+
+#[tauri::command]
+async fn set_cli_tool_config_enabled(
+    app: tauri::AppHandle,
+    tool_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    cli_tools::set_tool_config_enabled_async(&app, &tool_id, enabled).await
 }
 
 #[tauri::command]
@@ -219,6 +236,8 @@ pub fn run() {
             refresh_user_profile,
             get_cli_tools_status,
             get_proxy_enabled,
+            open_external_url,
+            set_cli_tool_config_enabled,
             set_proxy_enabled,
             apply_config_injection,
             get_explore_items,

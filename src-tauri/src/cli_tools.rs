@@ -1,5 +1,8 @@
 use crate::config::LOCAL_PROXY_HOST;
-use crate::grayscale_api::{fetch_grayscale_models, find_platform_models, GrayscaleModelEntry};
+use crate::grayscale_api::{
+    fetch_grayscale_models, find_platform_models, merge_pi_platform_response,
+    resolve_pi_grayscale_platform, GrayscaleModelEntry, GrayscalePlatformModels,
+};
 use crate::store::StoredSettings;
 use crate::store::{load_auth, load_backup, load_settings, save_backup};
 use regex::Regex;
@@ -18,6 +21,14 @@ pub struct CliToolStatus {
     pub id: String,
     pub name: String,
     pub supported: bool,
+    /// 本机是否检测到 CLI 可执行文件。
+    pub installed: bool,
+    /// 终端安装命令（通常为 curl 脚本）。
+    pub install_shell: String,
+    /// 官方快速开始文档地址。
+    pub quick_start_doc_url: String,
+    /// 用户是否允许为该工具注入配置（默认开启）。
+    pub config_enabled: bool,
     pub config_path: String,
     pub base_url_field: String,
     pub token_field: String,
@@ -28,6 +39,7 @@ enum ConfigFormat {
     Toml,
     DotEnv,
     CodexProviderToml,
+    PiAgentModels,
 }
 
 /// 旧版注入使用的自定义 provider，还原时需清理。
@@ -73,7 +85,8 @@ struct ToolDefinition {
     binaries: &'static [&'static str],
     base_url_field: &'static str,
     token_field: &'static str,
-    install_url: &'static str,
+    install_shell: &'static str,
+    quick_start_doc_url: &'static str,
     targets: &'static [ConfigTarget],
 }
 
@@ -101,6 +114,16 @@ const GEMINI_TARGETS: &[ConfigTarget] = &[ConfigTarget {
     }],
 }];
 
+const PI_TARGETS: &[ConfigTarget] = &[ConfigTarget {
+    relative: ".pi/agent/models.json",
+    format: ConfigFormat::PiAgentModels,
+    fields: &[],
+}];
+
+const PI_MANAGED_PROVIDERS_BACKUP_KEY: &str = "managed_providers";
+/// Pi 自定义 Provider 需要 apiKey 字段；实际鉴权由本地代理注入，此处仅占位。
+const PI_PROXY_API_KEY_PLACEHOLDER: &str = "zwitch";
+
 const TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
         id: "codex",
@@ -108,7 +131,8 @@ const TOOLS: &[ToolDefinition] = &[
         binaries: &["codex"],
         base_url_field: "openai_base_url",
         token_field: "OPENAI_API_KEY",
-        install_url: "https://developers.openai.com/codex/cli",
+        install_shell: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        quick_start_doc_url: "https://developers.openai.com/codex/cli",
         targets: CODEX_TARGETS,
     },
     ToolDefinition {
@@ -117,8 +141,19 @@ const TOOLS: &[ToolDefinition] = &[
         binaries: &["claude"],
         base_url_field: "env.ANTHROPIC_BASE_URL",
         token_field: "env.ANTHROPIC_AUTH_TOKEN",
-        install_url: "https://docs.anthropic.com/en/docs/claude-code",
+        install_shell: "curl -fsSL https://claude.ai/install.sh | bash",
+        quick_start_doc_url: "https://code.claude.com/docs/en/quickstart",
         targets: CLAUDE_TARGETS,
+    },
+    ToolDefinition {
+        id: "pi",
+        name: "Pi",
+        binaries: &["pi"],
+        base_url_field: "providers.*.baseUrl",
+        token_field: "providers.*.apiKey",
+        install_shell: "curl -fsSL https://pi.dev/install.sh | sh",
+        quick_start_doc_url: "https://badlogic-pi-mono.mintlify.app/coding-agent/overview",
+        targets: PI_TARGETS,
     },
 ];
 
@@ -129,7 +164,8 @@ const DISABLED_TOOLS: &[ToolDefinition] = &[ToolDefinition {
     binaries: &["gemini"],
     base_url_field: "GOOGLE_GEMINI_BASE_URL",
     token_field: "GEMINI_API_KEY",
-    install_url: "https://github.com/google-gemini/gemini-cli",
+    install_shell: "npm install -g @google/gemini-cli",
+    quick_start_doc_url: "https://github.com/google-gemini/gemini-cli",
     targets: GEMINI_TARGETS,
 }];
 
@@ -138,21 +174,71 @@ pub fn tool_ids() -> Vec<&'static str> {
     TOOLS.iter().map(|tool| tool.id).collect()
 }
 
-fn tool_should_inject(settings: &StoredSettings, _tool: &ToolDefinition) -> bool {
-    settings.proxy_enabled
+pub fn is_tool_config_enabled(settings: &StoredSettings, tool_id: &str) -> bool {
+    settings.tool_switches.get(tool_id).copied().unwrap_or(true)
 }
 
-pub fn get_cli_tools_status(_app: &AppHandle) -> Result<Vec<CliToolStatus>, String> {
+fn tool_should_inject(settings: &StoredSettings, tool: &ToolDefinition) -> bool {
+    settings.proxy_enabled && is_tool_config_enabled(settings, tool.id)
+}
+
+fn is_tool_installed(tool: &ToolDefinition) -> bool {
+    find_binary(tool.binaries).is_some()
+}
+
+pub async fn set_tool_config_enabled_async(
+    app: &AppHandle,
+    tool_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    if !TOOLS.iter().any(|tool| tool.id == tool_id) {
+        return Err(format!("未知 CLI 工具: {tool_id}"));
+    }
+
+    let mut settings = load_settings(app)?;
+    if enabled {
+        settings.tool_switches.remove(tool_id);
+    } else {
+        settings.tool_switches.insert(tool_id.to_string(), false);
+    }
+    crate::store::save_settings(app, &settings)?;
+    apply_config_injection_async(app).await?;
+    Ok(())
+}
+
+pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolStatus>, String> {
     let home = dirs::home_dir().ok_or_else(|| "无法获取用户目录".to_string())?;
+    let settings = load_settings(app)?;
+
+    let show_pi = if load_auth(app)
+        .ok()
+        .and_then(|auth| auth.authorization_code)
+        .is_some()
+    {
+        let grayscale_platforms = load_grayscale_platforms_by_tool(app).await;
+        let grayscale_models: HashMap<String, Vec<GrayscaleModelEntry>> = grayscale_platforms
+            .iter()
+            .map(|(tool_id, platform)| (tool_id.clone(), platform.additional_models.clone()))
+            .collect();
+        crate::grayscale_api::update_grayscale_cache(grayscale_models);
+        grayscale_platforms.contains_key("pi")
+    } else {
+        false
+    };
 
     Ok(TOOLS
         .iter()
+        .filter(|tool| tool.id != "pi" || show_pi)
         .map(|tool| {
             let config_path = home.join(tool.targets[0].relative);
             CliToolStatus {
                 id: tool.id.to_string(),
                 name: tool.name.to_string(),
                 supported: true,
+                installed: is_tool_installed(tool),
+                install_shell: tool.install_shell.to_string(),
+                quick_start_doc_url: tool.quick_start_doc_url.to_string(),
+                config_enabled: is_tool_config_enabled(&settings, tool.id),
                 config_path: config_path.to_string_lossy().to_string(),
                 base_url_field: tool.base_url_field.to_string(),
                 token_field: tool.token_field.to_string(),
@@ -179,29 +265,31 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
         return Err("请先登录并完成设备授权".to_string());
     }
 
-    let grayscale_models = if needs_inject {
-        load_grayscale_models_by_platform(app).await
+    let grayscale_platforms = if needs_inject {
+        load_grayscale_platforms_by_tool(app).await
     } else {
         HashMap::new()
     };
+    let grayscale_models: HashMap<String, Vec<GrayscaleModelEntry>> = grayscale_platforms
+        .iter()
+        .map(|(tool_id, platform)| (tool_id.clone(), platform.additional_models.clone()))
+        .collect();
     crate::grayscale_api::update_grayscale_cache(grayscale_models.clone());
 
+    let mut proxy_port = crate::proxy::local_port();
     if needs_inject {
         let preferred = detect_preferred_proxy_port(&home, &settings)?;
         if let Ok(fingerprint) = crate::device::get_or_create_fingerprint(app) {
-            crate::proxy::ensure_listening(app.clone(), fingerprint, preferred);
+            if let Some(started_port) =
+                crate::proxy::ensure_listening(app.clone(), fingerprint, preferred)
+            {
+                proxy_port = started_port;
+            }
         }
     }
 
-    let proxy_port = crate::proxy::local_port();
-
     for tool in TOOLS {
         let tool_enabled = tool_should_inject(&settings, tool);
-        let local_base = if proxy_port != 0 {
-            crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
-        } else {
-            crate::proxy::local_proxy_base(tool.id)
-        };
         let additional_models = grayscale_models
             .get(tool.id)
             .cloned()
@@ -209,6 +297,52 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
 
         for target in tool.targets {
             let config_path = home.join(target.relative);
+
+            if tool.id == "pi" {
+                let platform = grayscale_platforms.get(tool.id);
+                if !tool_enabled
+                    || platform.is_none_or(|platform| platform.additional_models.is_empty())
+                {
+                    if restore_config(app, &mut backup, tool, target, &config_path)? {
+                        backup_dirty = true;
+                    }
+                    continue;
+                }
+
+                if proxy_port == 0 {
+                    eprintln!("Pi: 本地代理未启动，跳过 models.json 注入");
+                    continue;
+                }
+
+                let already_injected = read_config_if_exists(&config_path)
+                    .map(|content| is_target_injected(tool, target, &content))
+                    .unwrap_or(false);
+
+                if !already_injected {
+                    backup_current_values(&mut backup, tool, target, &config_path)?;
+                    backup_dirty = true;
+                }
+
+                let local_base = if proxy_port != 0 {
+                    crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
+                } else {
+                    crate::proxy::local_proxy_base(tool.id)
+                };
+                inject_pi_grayscale_models(
+                    tool,
+                    target,
+                    &config_path,
+                    &local_base,
+                    platform.expect("pi platform checked above"),
+                )?;
+                continue;
+            }
+
+            let local_base = if proxy_port != 0 {
+                crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
+            } else {
+                crate::proxy::local_proxy_base(tool.id)
+            };
 
             if !tool_enabled {
                 if restore_config(app, &mut backup, tool, target, &config_path)? {
@@ -482,6 +616,14 @@ fn backup_absent_fields(
                     .or_insert_with(|| BACKUP_ABSENT.to_string());
             }
         }
+        ConfigFormat::PiAgentModels => {
+            entry
+                .entry(backup_key(tool.id, "snapshot"))
+                .or_insert_with(|| BACKUP_ABSENT.to_string());
+            entry
+                .entry(backup_key(tool.id, PI_MANAGED_PROVIDERS_BACKUP_KEY))
+                .or_insert_with(|| String::new());
+        }
     }
 }
 
@@ -542,6 +684,9 @@ fn backup_current_values(
                 entry.insert(backup_field_key, stored);
             }
         }
+        ConfigFormat::PiAgentModels => {
+            backup_pi_agent_models(entry, tool.id, &content);
+        }
     }
 
     Ok(())
@@ -578,6 +723,9 @@ fn is_target_injected(tool: &ToolDefinition, target: &ConfigTarget, content: &st
             read_toml_value(content, field.path)
                 .is_some_and(|url| is_local_proxy_base_url(&url, tool.id))
         }),
+        ConfigFormat::PiAgentModels => pi_managed_provider_keys(content)
+            .map(|keys| !keys.is_empty())
+            .unwrap_or(false),
     }
 }
 
@@ -614,6 +762,27 @@ fn read_injected_proxy_port(
             read_toml_value(content, field.path)
                 .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
         }),
+        ConfigFormat::PiAgentModels => serde_json::from_str::<Value>(content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("providers")
+                    .and_then(Value::as_object)
+                    .and_then(|providers| {
+                        providers.values().find_map(|provider| {
+                            provider
+                                .get("baseUrl")
+                                .and_then(Value::as_str)
+                                .and_then(|url| {
+                                    if is_local_proxy_pi_provider_base_url(url) {
+                                        crate::proxy::parse_local_proxy_port(url)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        })
+                    })
+            }),
     }
 }
 
@@ -693,9 +862,13 @@ fn restore_config(
                         write_dotenv_value(&content, field.path, original)?
                     }
                 }
-                ConfigFormat::CodexProviderToml => unreachable!(),
+                ConfigFormat::CodexProviderToml | ConfigFormat::PiAgentModels => unreachable!(),
             };
         }
+    }
+
+    if matches!(target.format, ConfigFormat::PiAgentModels) {
+        content = restore_pi_agent_models(&content, tool.id, &file_backup)?;
     }
 
     if matches!(target.format, ConfigFormat::CodexProviderToml) {
@@ -729,9 +902,10 @@ fn inject_values(
     } else {
         match target.format {
             ConfigFormat::Json => "{}".to_string(),
-            ConfigFormat::Toml | ConfigFormat::DotEnv | ConfigFormat::CodexProviderToml => {
-                String::new()
-            }
+            ConfigFormat::Toml
+            | ConfigFormat::DotEnv
+            | ConfigFormat::CodexProviderToml
+            | ConfigFormat::PiAgentModels => String::new(),
         }
     };
 
@@ -771,29 +945,381 @@ fn inject_values(
             }
             result
         }
+        ConfigFormat::PiAgentModels => {
+            unreachable!("Pi 配置在 apply_config_injection_async 中单独处理")
+        }
     };
 
     write_config(config_path, &new_content)
 }
 
-async fn load_grayscale_models_by_platform(
-    app: &AppHandle,
+fn pi_provider_id(provider: &str) -> String {
+    if provider.is_empty() {
+        "openai".to_string()
+    } else {
+        provider.to_string()
+    }
+}
+
+fn normalize_pi_base_path(base_path: &str) -> String {
+    let trimmed = base_path.trim();
+    if trimmed.is_empty() {
+        return "/openai".to_string();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn default_pi_base_path_for_provider(provider: &str) -> String {
+    match provider {
+        "gemini" | "google" | "google-generative-ai" => "/genai".to_string(),
+        "anthropic" => "/anthropic".to_string(),
+        _ => "/openai".to_string(),
+    }
+}
+
+fn infer_pi_api_from_base_path(base_path: &str) -> &'static str {
+    match normalize_pi_base_path(base_path).as_str() {
+        "/anthropic" => "anthropic-messages",
+        "/genai" => "google-generative-ai",
+        _ => "openai-responses",
+    }
+}
+
+fn resolve_pi_provider_base_path(
+    provider: &str,
+    models: &[GrayscaleModelEntry],
+    platform: &GrayscalePlatformModels,
+) -> String {
+    models
+        .iter()
+        .find_map(|model| model.base_path.clone())
+        .or_else(|| {
+            if platform.base_path.is_empty() {
+                None
+            } else {
+                Some(platform.base_path.clone())
+            }
+        })
+        .map(|path| normalize_pi_base_path(&path))
+        .unwrap_or_else(|| default_pi_base_path_for_provider(provider))
+}
+
+fn resolve_pi_provider_api(base_path: &str, models: &[GrayscaleModelEntry]) -> String {
+    models
+        .iter()
+        .find_map(|model| model.api.clone())
+        .unwrap_or_else(|| infer_pi_api_from_base_path(base_path).to_string())
+}
+
+fn build_pi_provider_base_url(local_proxy_base: &str, base_path: &str) -> String {
+    let local_proxy_base = local_proxy_base.trim_end_matches('/');
+    let base_path = normalize_pi_base_path(base_path);
+    format!("{local_proxy_base}{base_path}/v1")
+}
+
+fn is_local_proxy_pi_provider_base_url(url: &str) -> bool {
+    let prefix = format!("http://{LOCAL_PROXY_HOST}:");
+    let Some(rest) = url.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some(path) = rest.split_once('/').map(|(_, path)| path) else {
+        return false;
+    };
+    path.starts_with("pi/")
+}
+
+fn group_pi_models_by_key(
+    models: &[GrayscaleModelEntry],
 ) -> HashMap<String, Vec<GrayscaleModelEntry>> {
+    let mut grouped: HashMap<String, Vec<GrayscaleModelEntry>> = HashMap::new();
+    for model in models {
+        let group_key = if !model.key_id.is_empty() {
+            model.key_id.clone()
+        } else if !model.key_name.is_empty() {
+            model.key_name.clone()
+        } else if !model.provider.is_empty() {
+            model.provider.clone()
+        } else {
+            "openai".to_string()
+        };
+        grouped.entry(group_key).or_default().push(model.clone());
+    }
+    grouped
+}
+
+fn pi_provider_key_from_models(models: &[GrayscaleModelEntry]) -> String {
+    models
+        .iter()
+        .find_map(|model| {
+            if model.key_name.is_empty() {
+                None
+            } else {
+                Some(model.key_name.clone())
+            }
+        })
+        .or_else(|| {
+            models.first().and_then(|model| {
+                if model.key_id.is_empty() {
+                    None
+                } else {
+                    Some(model.key_id.clone())
+                }
+            })
+        })
+        .unwrap_or_else(|| {
+            pi_provider_id(
+                models
+                    .first()
+                    .map(|model| model.provider.as_str())
+                    .unwrap_or("openai"),
+            )
+        })
+}
+
+fn bifrost_provider_for_pi_models(models: &[GrayscaleModelEntry]) -> String {
+    models
+        .first()
+        .map(|model| model.provider.as_str())
+        .filter(|provider| !provider.is_empty())
+        .unwrap_or("openai")
+        .to_string()
+}
+
+fn build_pi_providers_config(
+    local_proxy_base: &str,
+    platform: &GrayscalePlatformModels,
+) -> (Value, Vec<String>) {
+    let mut providers = serde_json::Map::new();
+    let mut managed_keys = Vec::new();
+
+    for (_, models) in group_pi_models_by_key(&platform.additional_models) {
+        let provider_key = pi_provider_key_from_models(&models);
+        let bifrost_provider = bifrost_provider_for_pi_models(&models);
+        let base_path = resolve_pi_provider_base_path(&bifrost_provider, &models, platform);
+        let api = resolve_pi_provider_api(&base_path, &models);
+        let base_url = build_pi_provider_base_url(local_proxy_base, &base_path);
+        let model_entries: Vec<Value> = models
+            .iter()
+            .map(|model| {
+                let display_name = if model.key_name.is_empty() {
+                    format!("{} [灰度]", model.id)
+                } else {
+                    format!("{} [灰度]", model.key_name)
+                };
+                serde_json::json!({
+                    "id": model.id,
+                    "name": display_name,
+                })
+            })
+            .collect();
+
+        providers.insert(
+            provider_key.clone(),
+            serde_json::json!({
+                "baseUrl": base_url,
+                "api": api,
+                "apiKey": PI_PROXY_API_KEY_PLACEHOLDER,
+                "models": model_entries,
+            }),
+        );
+        managed_keys.push(provider_key);
+    }
+
+    (Value::Object(providers), managed_keys)
+}
+
+fn pi_managed_provider_keys_from_value(value: &Value) -> Vec<String> {
+    let Some(providers) = value.get("providers").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    providers
+        .iter()
+        .filter_map(|(key, provider)| {
+            provider
+                .get("baseUrl")
+                .and_then(Value::as_str)
+                .filter(|url| is_local_proxy_pi_provider_base_url(url))
+                .map(|_| key.clone())
+        })
+        .collect()
+}
+
+fn pi_managed_provider_keys(content: &str) -> Option<Vec<String>> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    Some(pi_managed_provider_keys_from_value(&value))
+}
+
+fn backup_pi_agent_models(entry: &mut HashMap<String, String>, tool_id: &str, content: &str) {
+    if is_zwitch_injected_pi_models(content) {
+        return;
+    }
+
+    entry
+        .entry(backup_key(tool_id, "snapshot"))
+        .or_insert_with(|| content.to_string());
+
+    let managed_keys = pi_managed_provider_keys(content).unwrap_or_default();
+    entry
+        .entry(backup_key(tool_id, PI_MANAGED_PROVIDERS_BACKUP_KEY))
+        .or_insert_with(|| managed_keys.join(","));
+}
+
+fn is_zwitch_injected_pi_models(content: &str) -> bool {
+    pi_managed_provider_keys(content)
+        .is_some_and(|keys| !keys.is_empty())
+}
+
+fn restore_pi_agent_models(
+    content: &str,
+    tool_id: &str,
+    file_backup: &HashMap<String, String>,
+) -> Result<String, String> {
+    if let Some(snapshot) = file_backup.get(&backup_key(tool_id, "snapshot")) {
+        if snapshot != BACKUP_ABSENT {
+            return Ok(snapshot.clone());
+        }
+    }
+
+    let mut value: Value = if content.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(content).map_err(|e| format!("解析 Pi models.json 失败: {e}"))?
+    };
+
+    let managed_keys: Vec<String> = file_backup
+        .get(&backup_key(tool_id, PI_MANAGED_PROVIDERS_BACKUP_KEY))
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|keys: &Vec<String>| !keys.is_empty())
+        .unwrap_or_else(|| pi_managed_provider_keys(content).unwrap_or_default());
+
+    if let Some(providers) = value
+        .as_object_mut()
+        .and_then(|root| root.get_mut("providers"))
+        .and_then(Value::as_object_mut)
+    {
+        for key in managed_keys {
+            providers.remove(&key);
+        }
+        if providers.is_empty() {
+            if let Some(root) = value.as_object_mut() {
+                root.remove("providers");
+            }
+        }
+    }
+
+    if value.as_object().is_some_and(|root| root.is_empty()) {
+        return Ok(String::new());
+    }
+
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+fn inject_pi_grayscale_models(
+    _tool: &ToolDefinition,
+    _target: &ConfigTarget,
+    config_path: &Path,
+    local_proxy_base: &str,
+    platform: &GrayscalePlatformModels,
+) -> Result<(), String> {
+    ensure_parent(config_path)?;
+
+    let content = if config_path.exists() {
+        fs::read_to_string(config_path).map_err(|e| format!("读取配置失败: {e}"))?
+    } else {
+        String::new()
+    };
+
+    let mut value: Value = if content.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(&content).map_err(|e| format!("解析 Pi models.json 失败: {e}"))?
+    };
+
+    let (injected_providers, managed_keys) = build_pi_providers_config(local_proxy_base, platform);
+
+    let existing_managed = pi_managed_provider_keys_from_value(&value);
+
+    let root = value
+        .as_object_mut()
+        .ok_or_else(|| "Pi models.json 根节点必须是对象".to_string())?;
+
+    if !root.contains_key("providers") {
+        root.insert("providers".to_string(), Value::Object(Default::default()));
+    }
+
+    let providers = root
+        .get_mut("providers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "Pi models.json providers 必须是对象".to_string())?;
+    for key in existing_managed {
+        providers.remove(&key);
+    }
+
+    if let Some(injected) = injected_providers.as_object() {
+        for (key, provider_value) in injected {
+            providers.insert(key.clone(), provider_value.clone());
+        }
+    }
+
+    let _ = managed_keys;
+
+    let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    write_config(config_path, &new_content)
+}
+
+async fn resolve_grayscale_api_credential(
+    app: &AppHandle,
+    auth: &crate::store::StoredAuth,
+) -> Result<String, String> {
+    if let Some(token) = crate::auth::resolve_aone_session_token(auth) {
+        return Ok(token);
+    }
+
+    eprintln!("灰度模型 API: 浏览器会话不可用，尝试使用设备临时凭证");
+    let fingerprint = crate::device::get_or_create_fingerprint(app)?;
+    let code = auth
+        .authorization_code
+        .clone()
+        .ok_or_else(|| "未登录，无法拉取灰度模型".to_string())?;
+    let base = crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref());
+    let resp = crate::user_api::exchange_device_code(&code, &fingerprint, &base)
+        .await
+        .map_err(|e| e.message())?;
+    Ok(resp.credential().to_string())
+}
+
+async fn load_grayscale_platforms_by_tool(
+    app: &AppHandle,
+) -> HashMap<String, GrayscalePlatformModels> {
     let auth = match load_auth(app) {
         Ok(auth) => auth,
         Err(_) => return HashMap::new(),
     };
     let api_base = crate::user_api::resolve_api_base_url(auth.api_base_url.as_deref());
 
-    let Some(credential) = crate::auth::resolve_aone_session_token(&auth) else {
-        eprintln!("拉取灰度模型失败: 缺少浏览器登录会话，请重新登录");
-        return HashMap::new();
+    let credential = match resolve_grayscale_api_credential(app, &auth).await {
+        Ok(credential) => credential,
+        Err(error) => {
+            eprintln!("拉取灰度模型失败: {error}");
+            return HashMap::new();
+        }
     };
 
-    let response = match fetch_grayscale_models(None, &credential, &api_base).await {
+    let mut response = match fetch_grayscale_models(None, &credential, &api_base).await {
         Ok(response) => response,
         Err(crate::user_api::ApiError::Unauthorized) => {
-            eprintln!("拉取灰度模型失败: 登录会话已过期，请重新登录");
+            eprintln!("拉取灰度模型失败: 凭证无效或已过期，请重新登录");
             return HashMap::new();
         }
         Err(error) => {
@@ -802,13 +1328,32 @@ async fn load_grayscale_models_by_platform(
         }
     };
 
+    if let Ok(pi_only) = fetch_grayscale_models(Some("pi"), &credential, &api_base).await {
+        response = merge_pi_platform_response(response, pi_only);
+    }
+
     let mut by_platform = HashMap::new();
     for tool in TOOLS {
+        if tool.id == "pi" {
+            if let Some(platform) = resolve_pi_grayscale_platform(&response) {
+                eprintln!(
+                    "Pi: 找到 {} 个灰度模型待注入",
+                    platform.additional_models.len()
+                );
+                by_platform.insert(tool.id.to_string(), platform);
+            } else {
+                eprintln!(
+                    "Pi: 未找到可注入的灰度模型（检查 platform=pi 或 codex 自定义 Provider）"
+                );
+            }
+            continue;
+        }
+
         let Some(platform) = find_platform_models(&response, tool.id) else {
             continue;
         };
         if !platform.additional_models.is_empty() {
-            by_platform.insert(tool.id.to_string(), platform.additional_models.clone());
+            by_platform.insert(tool.id.to_string(), platform.clone());
         }
     }
 
@@ -1580,6 +2125,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_tool_status_reports_install_metadata() {
+        let tool = &TOOLS[0];
+        let status = CliToolStatus {
+            id: tool.id.to_string(),
+            name: tool.name.to_string(),
+            supported: true,
+            installed: is_tool_installed(tool),
+            install_shell: tool.install_shell.to_string(),
+            quick_start_doc_url: tool.quick_start_doc_url.to_string(),
+            config_enabled: true,
+            config_path: "/tmp/config".to_string(),
+            base_url_field: tool.base_url_field.to_string(),
+            token_field: tool.token_field.to_string(),
+        };
+        assert_eq!(
+            status.install_shell,
+            "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+        );
+        assert_eq!(
+            status.quick_start_doc_url,
+            "https://developers.openai.com/codex/cli"
+        );
+    }
+
+    #[test]
+    fn tool_config_defaults_to_enabled() {
+        let settings = StoredSettings::default();
+        assert!(is_tool_config_enabled(&settings, "codex"));
+        assert!(is_tool_config_enabled(&settings, "claude"));
+        assert!(!tool_should_inject(&settings, &TOOLS[0]));
+    }
+
+    #[test]
+    fn tool_config_switch_disables_injection() {
+        let mut settings = StoredSettings {
+            proxy_enabled: true,
+            tool_switches: HashMap::from([(String::from("codex"), false)]),
+        };
+        assert!(!is_tool_config_enabled(&settings, "codex"));
+        assert!(is_tool_config_enabled(&settings, "claude"));
+        assert!(!tool_should_inject(&settings, &TOOLS[0]));
+        assert!(tool_should_inject(&settings, &TOOLS[1]));
+    }
+
+    #[test]
     fn codex_uses_openai_base_url_field() {
         assert_eq!(TOOLS[0].base_url_field, "openai_base_url");
         assert_eq!(TOOLS[0].token_field, "OPENAI_API_KEY");
@@ -1794,6 +2384,8 @@ base_url = "http://old.example/codex"
             key_id: "gray-anthropic".into(),
             key_name: "灰度 Anthropic".into(),
             source: "grayscale".into(),
+            api: None,
+            base_path: None,
         }];
         inject_claude_grayscale_models(&mut value, &models);
         let env = value.get("env").unwrap().as_object().unwrap();
@@ -1820,6 +2412,106 @@ base_url = "http://old.example/codex"
         let env = value.get("env").unwrap().as_object().unwrap();
         assert!(!env.contains_key("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"));
         assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
+    }
+
+    fn pi_test_platform(models: Vec<GrayscaleModelEntry>) -> GrayscalePlatformModels {
+        GrayscalePlatformModels {
+            id: "pi".into(),
+            label: String::new(),
+            base_path: "/openai".into(),
+            injection_mode: String::new(),
+            models: vec![],
+            additional_models: models,
+        }
+    }
+
+    #[test]
+    fn pi_provider_key_uses_key_name_not_provider_id() {
+        let models = vec![GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "测试".into(),
+            key_id: "gray-key-1".into(),
+            key_name: "灰度 Mythos".into(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+        }];
+        assert_eq!(pi_provider_key_from_models(&models), "灰度 Mythos");
+    }
+
+    #[test]
+    fn pi_builds_custom_provider_config_from_grayscale_models() {
+        let platform = pi_test_platform(vec![
+            GrayscaleModelEntry {
+                id: "claude-mythos-preview".into(),
+                provider: "claude".into(),
+                key_id: "gray-claude-key".into(),
+                key_name: "灰度 Claude".into(),
+                source: "grayscale".into(),
+                api: Some("openai-responses".into()),
+                base_path: Some("/openai".into()),
+            },
+            GrayscaleModelEntry {
+                id: "claude-mythos-preview-fast".into(),
+                provider: "claude".into(),
+                key_id: "gray-claude-key".into(),
+                key_name: "灰度 Claude".into(),
+                source: "grayscale".into(),
+                api: Some("openai-responses".into()),
+                base_path: Some("/openai".into()),
+            },
+        ]);
+
+        let (providers, managed_keys) =
+            build_pi_providers_config("http://127.0.0.1:51805/pi", &platform);
+        let providers = providers.as_object().unwrap();
+        let claude = providers.get("灰度 Claude").unwrap().as_object().unwrap();
+
+        assert_eq!(managed_keys, vec!["灰度 Claude"]);
+        assert_eq!(
+            claude.get("baseUrl").and_then(Value::as_str),
+            Some("http://127.0.0.1:51805/pi/openai/v1")
+        );
+        assert_eq!(
+            claude.get("api").and_then(Value::as_str),
+            Some("openai-responses")
+        );
+        assert_eq!(
+            claude.get("apiKey").and_then(Value::as_str),
+            Some(PI_PROXY_API_KEY_PLACEHOLDER)
+        );
+        assert_eq!(claude.get("models").unwrap().as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pi_restore_removes_injected_providers() {
+        let original = r#"{"providers":{"local":{"api":"openai-completions"}}}"#;
+        let (providers, _) = build_pi_providers_config(
+            "http://127.0.0.1:51805/pi",
+            &pi_test_platform(vec![GrayscaleModelEntry {
+                id: "claude-mythos-preview".into(),
+                provider: "claude".into(),
+                key_id: "gray-claude-key".into(),
+                key_name: "灰度 Claude".into(),
+                source: "grayscale".into(),
+                api: Some("openai-responses".into()),
+                base_path: Some("/openai".into()),
+            }]),
+        );
+        let mut value: Value = serde_json::from_str(original).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("providers".to_string(), providers);
+        let injected = serde_json::to_string_pretty(&value).unwrap();
+
+        let mut backup = HashMap::new();
+        backup_pi_agent_models(&mut backup, "pi", original);
+        let restored = restore_pi_agent_models(&injected, "pi", &backup).unwrap();
+        let restored_value: Value = serde_json::from_str(&restored).unwrap();
+        let providers = restored_value.get("providers").unwrap().as_object().unwrap();
+        assert!(providers.contains_key("local"));
+        assert!(!providers.contains_key("灰度 Claude"));
     }
 
     #[test]

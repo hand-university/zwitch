@@ -11,6 +11,10 @@ export interface CliToolStatus {
   id: string;
   name: string;
   supported: boolean;
+  installed: boolean;
+  install_shell: string;
+  quick_start_doc_url: string;
+  config_enabled: boolean;
 }
 
 export type AppPage =
