@@ -273,7 +273,7 @@ fn build_upstream_url(tool_id: &str, gateway: &str, rest: &str) -> String {
                 format!("{gateway}/genai/{rest}")
             }
         }
-        "pi" => {
+        "opencode" => {
             if rest.starts_with("openai/")
                 || rest.starts_with("anthropic/")
                 || rest.starts_with("genai/")
@@ -421,7 +421,7 @@ fn merge_grayscale_models_into_list(
     additional: &[crate::grayscale_api::GrayscaleModelEntry],
 ) -> Result<String, String> {
     match tool_id {
-        "codex" | "pi" => {
+        "codex" | "opencode" => {
             crate::grayscale_api::append_openai_models_list(upstream_body, additional)
         }
         "claude" => crate::grayscale_api::append_anthropic_models_list(upstream_body, additional),
