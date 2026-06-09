@@ -53,6 +53,9 @@ pub struct GrayscaleModelEntry {
     pub max_tokens: Option<u64>,
 }
 
+/// 灰度模型注入时的默认 model id。
+pub const GRAYSCALE_DEFAULT_MODEL_ID: &str = "claude-mythos-preview-fast";
+
 impl GrayscalePlatformModels {
     pub fn additional_model_ids(&self) -> Vec<String> {
         self.additional_models.iter().map(|entry| entry.id.clone()).collect()
@@ -129,6 +132,36 @@ pub fn grayscale_additional_models(platform: &str) -> Vec<GrayscaleModelEntry> {
         .unwrap_or_default()
 }
 
+/// 将 model id 转为展示名称：按 `-` 分段，每段首字母大写后用空格连接。
+pub fn grayscale_model_display_name(model_id: &str) -> String {
+    model_id
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 将默认灰度模型置于列表首位，便于客户端将其作为默认选项。
+pub fn prioritize_grayscale_default_model(
+    models: &[GrayscaleModelEntry],
+) -> Vec<GrayscaleModelEntry> {
+    let mut ordered = models.to_vec();
+    if let Some(index) = ordered
+        .iter()
+        .position(|model| model.id == GRAYSCALE_DEFAULT_MODEL_ID)
+    {
+        let preferred = ordered.remove(index);
+        ordered.insert(0, preferred);
+    }
+    ordered
+}
+
 pub fn openai_models_list_response(models: &[GrayscaleModelEntry]) -> String {
     let data: Vec<_> = models
         .iter()
@@ -201,11 +234,7 @@ pub fn append_anthropic_models_list(
         if existing.contains(&model.id) {
             continue;
         }
-        let display_name = if model.key_name.is_empty() {
-            format!("{} [灰度]", model.id)
-        } else {
-            format!("{} [灰度]", model.key_name)
-        };
+        let display_name = grayscale_model_display_name(&model.id);
         data.push(json!({
             "id": model.id,
             "display_name": display_name,
@@ -220,14 +249,9 @@ pub fn anthropic_models_list_response(models: &[GrayscaleModelEntry]) -> String 
     let data: Vec<_> = models
         .iter()
         .map(|model| {
-            let display_name = if model.key_name.is_empty() {
-                format!("{} [灰度]", model.id)
-            } else {
-                format!("{} [灰度]", model.key_name)
-            };
             json!({
                 "id": model.id,
-                "display_name": display_name,
+                "display_name": grayscale_model_display_name(&model.id),
                 "type": "model",
             })
         })
@@ -378,6 +402,45 @@ fn test_grayscale_model(id: &str, provider: &str) -> GrayscaleModelEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prioritize_grayscale_default_model_moves_preferred_id_first() {
+        let models = vec![
+            test_grayscale_model("claude-mythos-preview", "anthropic"),
+            test_grayscale_model("claude-mythos-preview-fast", "anthropic"),
+        ];
+        let ordered = prioritize_grayscale_default_model(&models);
+        assert_eq!(
+            ordered.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
+            vec!["claude-mythos-preview-fast", "claude-mythos-preview"]
+        );
+    }
+
+    #[test]
+    fn grayscale_model_display_name_title_cases_dash_segments() {
+        assert_eq!(
+            grayscale_model_display_name("claude-mythos-preview"),
+            "Claude Mythos Preview"
+        );
+        assert_eq!(
+            grayscale_model_display_name("claude-sonnet-4-5"),
+            "Claude Sonnet 4 5"
+        );
+        assert_eq!(grayscale_model_display_name("gpt-5.4"), "Gpt 5.4");
+    }
+
+    #[test]
+    fn anthropic_models_list_uses_title_cased_display_name() {
+        let response = anthropic_models_list_response(&[test_grayscale_model(
+            "claude-mythos-preview",
+            "anthropic",
+        )]);
+        let parsed: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed["data"][0]["display_name"].as_str(),
+            Some("Claude Mythos Preview")
+        );
+    }
 
     #[test]
     fn append_openai_models_list_keeps_upstream_and_adds_grayscale() {

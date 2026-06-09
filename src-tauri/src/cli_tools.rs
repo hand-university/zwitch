@@ -1,7 +1,9 @@
 use crate::config::LOCAL_PROXY_HOST;
 use crate::grayscale_api::{
-    fetch_grayscale_models, find_platform_models, merge_opencode_platform_response,
+    fetch_grayscale_models, find_platform_models, grayscale_model_display_name,
+    merge_opencode_platform_response, prioritize_grayscale_default_model,
     resolve_opencode_grayscale_platform, GrayscaleModelEntry, GrayscalePlatformModels,
+    GRAYSCALE_DEFAULT_MODEL_ID,
 };
 use crate::store::StoredSettings;
 use crate::store::{load_auth, load_backup, load_settings, save_backup};
@@ -127,6 +129,10 @@ const OPENCODE_PROXY_API_KEY_PLACEHOLDER: &str = "zwitch";
 const OPENCODE_OPENAI_COMPATIBLE_NPM: &str = "@ai-sdk/openai-compatible";
 /// 使用 `/v1/responses` 的 Provider 改用官方 OpenAI 适配器。
 const OPENCODE_OPENAI_RESPONSES_NPM: &str = "@ai-sdk/openai";
+/// OpenCode 灰度模型未声明 `context_window` 时的默认上下文窗口（tokens）。
+const OPENCODE_DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
+/// OpenCode schema 要求 `limit.output` 与 `limit.context` 同时存在时的默认最大输出（tokens）。
+const OPENCODE_DEFAULT_MAX_OUTPUT: u64 = 65_536;
 
 const TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -1028,25 +1034,24 @@ fn resolve_opencode_provider_api(base_path: &str, models: &[GrayscaleModelEntry]
 
 /// 构造 OpenCode `provider.<key>.models.<id>` 的取值。
 fn build_opencode_model_entry(model: &GrayscaleModelEntry) -> Value {
-    let display_name = if model.key_name.is_empty() {
-        format!("{} [灰度]", model.id)
-    } else {
-        format!("{} [灰度]", model.key_name)
-    };
-
     let mut entry = serde_json::Map::new();
-    entry.insert("name".to_string(), Value::String(display_name));
+    entry.insert(
+        "name".to_string(),
+        Value::String(grayscale_model_display_name(&model.id)),
+    );
 
     let mut limit = serde_json::Map::new();
-    if let Some(context_window) = model.context_window.filter(|value| *value > 0) {
-        limit.insert("context".to_string(), Value::Number(context_window.into()));
-    }
-    if let Some(max_tokens) = model.max_tokens.filter(|value| *value > 0) {
-        limit.insert("output".to_string(), Value::Number(max_tokens.into()));
-    }
-    if !limit.is_empty() {
-        entry.insert("limit".to_string(), Value::Object(limit));
-    }
+    let context_window = model
+        .context_window
+        .filter(|value| *value > 0)
+        .unwrap_or(OPENCODE_DEFAULT_CONTEXT_WINDOW);
+    let max_output = model
+        .max_tokens
+        .filter(|value| *value > 0)
+        .unwrap_or(OPENCODE_DEFAULT_MAX_OUTPUT);
+    limit.insert("context".to_string(), Value::Number(context_window.into()));
+    limit.insert("output".to_string(), Value::Number(max_output.into()));
+    entry.insert("limit".to_string(), Value::Object(limit));
     Value::Object(entry)
 }
 
@@ -1171,11 +1176,9 @@ fn build_opencode_providers_config(
     (Value::Object(providers), managed_keys)
 }
 
-fn opencode_managed_provider_keys_from_value(value: &Value) -> Vec<String> {
-    let Some(providers) = value.get("provider").and_then(Value::as_object) else {
-        return Vec::new();
-    };
-
+fn opencode_managed_provider_keys_from_providers(
+    providers: &serde_json::Map<String, Value>,
+) -> Vec<String> {
     providers
         .iter()
         .filter_map(|(key, provider)| {
@@ -1184,6 +1187,82 @@ fn opencode_managed_provider_keys_from_value(value: &Value) -> Vec<String> {
                 .map(|_| key.clone())
         })
         .collect()
+}
+
+fn opencode_provider_display_name<'a>(provider: &'a Value, key: &'a str) -> &'a str {
+    provider
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(key)
+}
+
+fn opencode_provider_keys_matching_name(
+    providers: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Vec<String> {
+    providers
+        .iter()
+        .filter_map(|(key, provider)| {
+            if opencode_provider_display_name(provider, key) == name || key == name {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// 将灰度 Provider 合并进 `opencode.json`：移除此前注入项，并按 `name`/key 替换同名 Provider。
+fn merge_opencode_injected_providers(
+    providers: &mut serde_json::Map<String, Value>,
+    injected_providers: &Value,
+) {
+    let Some(injected) = injected_providers.as_object() else {
+        return;
+    };
+
+    let mut keys_to_remove: HashSet<String> =
+        opencode_managed_provider_keys_from_providers(providers)
+            .into_iter()
+            .collect();
+
+    for (key, provider_value) in injected {
+        let injected_name = opencode_provider_display_name(provider_value, key);
+        for existing_key in opencode_provider_keys_matching_name(providers, injected_name) {
+            keys_to_remove.insert(existing_key);
+        }
+    }
+
+    for key in keys_to_remove {
+        providers.remove(&key);
+    }
+
+    for (key, provider_value) in injected {
+        providers.insert(key.clone(), provider_value.clone());
+    }
+}
+
+fn resolve_opencode_default_model(platform: &GrayscalePlatformModels) -> Option<String> {
+    for (_, models) in group_opencode_models_by_key(&platform.additional_models) {
+        if !models
+            .iter()
+            .any(|model| model.id == GRAYSCALE_DEFAULT_MODEL_ID)
+        {
+            continue;
+        }
+        let provider_key = opencode_provider_key_from_models(&models);
+        return Some(format!("{provider_key}/{GRAYSCALE_DEFAULT_MODEL_ID}"));
+    }
+    None
+}
+
+fn opencode_managed_provider_keys_from_value(value: &Value) -> Vec<String> {
+    let Some(providers) = value.get("provider").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+
+    opencode_managed_provider_keys_from_providers(providers)
 }
 
 fn opencode_managed_provider_keys(content: &str) -> Option<Vec<String>> {
@@ -1283,10 +1362,8 @@ fn inject_opencode_grayscale_models(
         serde_json::from_str(&content).map_err(|e| format!("解析 opencode.json 失败: {e}"))?
     };
 
-    let (injected_providers, managed_keys) =
+    let (injected_providers, _managed_keys) =
         build_opencode_providers_config(local_proxy_base, platform);
-
-    let existing_managed = opencode_managed_provider_keys_from_value(&value);
 
     let root = value
         .as_object_mut()
@@ -1300,17 +1377,11 @@ fn inject_opencode_grayscale_models(
         .get_mut("provider")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| "opencode.json provider 必须是对象".to_string())?;
-    for key in existing_managed {
-        providers.remove(&key);
-    }
+    merge_opencode_injected_providers(providers, &injected_providers);
 
-    if let Some(injected) = injected_providers.as_object() {
-        for (key, provider_value) in injected {
-            providers.insert(key.clone(), provider_value.clone());
-        }
+    if let Some(model) = resolve_opencode_default_model(platform) {
+        root.insert("model".to_string(), Value::String(model));
     }
-
-    let _ = managed_keys;
 
     let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
     write_config(config_path, &new_content)
@@ -1444,16 +1515,21 @@ fn inject_claude_grayscale_models(value: &mut Value, additional_models: &[Graysc
         env.remove(CLAUDE_GATEWAY_DISCOVERY_ENV);
     }
 
-    for (index, model) in additional_models.iter().enumerate() {
+    for (index, model) in prioritize_grayscale_default_model(additional_models)
+        .iter()
+        .enumerate()
+    {
         let (id_key, name_key, description_key) = claude_custom_model_env_keys(index);
-        let display_name = format!("{} [灰度]", model.id);
         let description = if model.key_name.is_empty() {
             "灰度模型".to_string()
         } else {
             format!("{}（灰度）", model.key_name)
         };
         env.insert(id_key, Value::String(model.id.clone()));
-        env.insert(name_key, Value::String(display_name));
+        env.insert(
+            name_key,
+            Value::String(grayscale_model_display_name(&model.id)),
+        );
         env.insert(description_key, Value::String(description));
     }
 }
@@ -2416,6 +2492,76 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
+    fn claude_prioritizes_default_grayscale_model() {
+        let mut value = serde_json::json!({ "env": {} });
+        inject_claude_grayscale_models(
+            &mut value,
+            &[
+                GrayscaleModelEntry {
+                    id: "claude-mythos-preview".into(),
+                    provider: "anthropic".into(),
+                    key_id: String::new(),
+                    key_name: String::new(),
+                    source: "grayscale".into(),
+                    api: None,
+                    base_path: None,
+                    context_window: None,
+                    max_tokens: None,
+                },
+                GrayscaleModelEntry {
+                    id: "claude-mythos-preview-fast".into(),
+                    provider: "anthropic".into(),
+                    key_id: String::new(),
+                    key_name: String::new(),
+                    source: "grayscale".into(),
+                    api: None,
+                    base_path: None,
+                    context_window: None,
+                    max_tokens: None,
+                },
+            ],
+        );
+        let env = value.get("env").unwrap().as_object().unwrap();
+        assert_eq!(
+            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION")
+                .and_then(Value::as_str),
+            Some("claude-mythos-preview-fast")
+        );
+    }
+
+    #[test]
+    fn opencode_sets_default_model_selector() {
+        let platform = opencode_test_platform(vec![
+            GrayscaleModelEntry {
+                id: "claude-mythos-preview".into(),
+                provider: "claude".into(),
+                key_id: "gray-claude-key".into(),
+                key_name: "claude".into(),
+                source: "grayscale".into(),
+                api: Some("openai-responses".into()),
+                base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
+            },
+            GrayscaleModelEntry {
+                id: "claude-mythos-preview-fast".into(),
+                provider: "claude".into(),
+                key_id: "gray-claude-key".into(),
+                key_name: "claude".into(),
+                source: "grayscale".into(),
+                api: Some("openai-responses".into()),
+                base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
+            },
+        ]);
+        assert_eq!(
+            resolve_opencode_default_model(&platform).as_deref(),
+            Some("claude/claude-mythos-preview-fast")
+        );
+    }
+
+    #[test]
     fn claude_injects_grayscale_models_into_env() {
         let mut value = serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "http://example" } });
         let models = vec![GrayscaleModelEntry {
@@ -2443,7 +2589,7 @@ base_url = "http://old.example/codex"
         assert_eq!(
             env.get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
                 .and_then(Value::as_str),
-            Some("claude-sonnet-4-5 [灰度]")
+            Some("Claude Sonnet 4 5")
         );
     }
 
@@ -2583,10 +2729,14 @@ base_url = "http://old.example/codex"
         let limit = entry.get("limit").unwrap().as_object().unwrap();
         assert_eq!(limit.get("context").and_then(Value::as_u64), Some(200_000));
         assert_eq!(limit.get("output").and_then(Value::as_u64), Some(32_000));
+        assert_eq!(
+            entry.get("name").and_then(Value::as_str),
+            Some("Claude Mythos Preview")
+        );
     }
 
     #[test]
-    fn opencode_model_entry_omits_limit_when_api_missing() {
+    fn opencode_model_entry_defaults_context_when_api_missing() {
         let entry = build_opencode_model_entry(&GrayscaleModelEntry {
             id: "claude-mythos-preview".into(),
             provider: "claude".into(),
@@ -2598,8 +2748,57 @@ base_url = "http://old.example/codex"
             context_window: None,
             max_tokens: None,
         });
-        let object = entry.as_object().unwrap();
-        assert!(!object.contains_key("limit"));
+        let limit = entry.get("limit").unwrap().as_object().unwrap();
+        assert_eq!(
+            limit.get("context").and_then(Value::as_u64),
+            Some(OPENCODE_DEFAULT_CONTEXT_WINDOW)
+        );
+        assert_eq!(
+            limit.get("output").and_then(Value::as_u64),
+            Some(OPENCODE_DEFAULT_MAX_OUTPUT)
+        );
+    }
+
+    #[test]
+    fn opencode_injection_replaces_existing_provider_with_same_name() {
+        let mut providers = serde_json::Map::new();
+        providers.insert(
+            "custom-claude".into(),
+            serde_json::json!({
+                "name": "claude",
+                "npm": "@ai-sdk/openai",
+                "options": { "baseURL": "https://api.example.com/v1" }
+            }),
+        );
+
+        let (injected, _) = build_opencode_providers_config(
+            "http://127.0.0.1:51805/opencode",
+            &opencode_test_platform(vec![GrayscaleModelEntry {
+                id: "claude-mythos-preview".into(),
+                provider: "claude".into(),
+                key_id: "gray-claude-key".into(),
+                key_name: "claude".into(),
+                source: "grayscale".into(),
+                api: Some("openai-responses".into()),
+                base_path: Some("/openai".into()),
+                context_window: None,
+                max_tokens: None,
+            }]),
+        );
+
+        merge_opencode_injected_providers(&mut providers, &injected);
+
+        assert_eq!(providers.len(), 1);
+        assert!(providers.contains_key("claude"));
+        assert!(!providers.contains_key("custom-claude"));
+        let provider = providers.get("claude").unwrap();
+        assert_eq!(
+            provider
+                .get("options")
+                .and_then(|options| options.get("baseURL"))
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:51805/opencode/openai/v1")
+        );
     }
 
     #[test]
@@ -2620,15 +2819,15 @@ base_url = "http://old.example/codex"
             }]),
         );
         let mut value: Value = serde_json::from_str(original).unwrap();
-        for (key, provider_value) in providers.as_object().unwrap() {
+        merge_opencode_injected_providers(
             value
                 .as_object_mut()
                 .unwrap()
                 .get_mut("provider")
                 .and_then(Value::as_object_mut)
-                .unwrap()
-                .insert(key.clone(), provider_value.clone());
-        }
+                .unwrap(),
+            &providers,
+        );
         let injected = serde_json::to_string_pretty(&value).unwrap();
 
         let mut backup = HashMap::new();
