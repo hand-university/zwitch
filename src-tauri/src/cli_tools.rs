@@ -133,6 +133,24 @@ const OPENCODE_OPENAI_RESPONSES_NPM: &str = "@ai-sdk/openai";
 const OPENCODE_DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 /// OpenCode schema 要求 `limit.output` 与 `limit.context` 同时存在时的默认最大输出（tokens）。
 const OPENCODE_DEFAULT_MAX_OUTPUT: u64 = 65_536;
+/// OpenCode 图片代理插件落盘位置（OpenCode 全局插件目录）。
+const OPENCODE_IMAGE_PROXY_PLUGIN_RELATIVE: &str =
+    ".config/opencode/plugins/opencode-image-proxy.ts";
+/// OpenCode 图片代理插件的配置文件（OpenCode 配置目录）。
+const OPENCODE_IMAGE_PROXY_CONFIG_RELATIVE: &str = ".config/opencode/opencode-image-proxy.json";
+/// 图片代理插件源码，编译期内嵌，注入时若缺失则落盘。
+const OPENCODE_IMAGE_PROXY_PLUGIN_SOURCE: &str = include_str!("../../opencode-image-proxy.ts");
+/// 注入 OpenCode 的 OpenAI 自定义 Provider key。
+/// 不能使用 `openai`：会与 OpenCode 内置 Provider 冲突，触发其 OAuth 凭证刷新（401）。
+const OPENCODE_OPENAI_PROVIDER_KEY: &str = "zwitch-openai";
+/// 旧版本注入使用的 Provider key，迁移配置时识别。
+const OPENCODE_OPENAI_LEGACY_PROVIDER_KEY: &str = "openai";
+/// OpenAI 自定义 Provider 暴露的模型列表。
+const OPENCODE_OPENAI_MODEL_IDS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
+/// 图片识别服务使用的模型。
+const OPENCODE_IMAGE_READER_MODEL_ID: &str = "gpt-5.4";
+/// 图片代理插件的默认分析提示词。
+const OPENCODE_IMAGE_ANALYSIS_PROMPT: &str = "The user has pasted an image into their chat. Describe what you see as if you are directly observing the image. Be thorough but concise. Include:\n- All visible elements (objects, text, UI elements, people, etc.)\n- Exact transcription of any text\n- The context and purpose of the image\n- Any relevant technical details\n\nDescribe it naturally, as if explaining to someone what you're looking at right now.";
 
 const TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -193,7 +211,28 @@ fn tool_should_inject(settings: &StoredSettings, tool: &ToolDefinition) -> bool 
 }
 
 fn is_tool_installed(tool: &ToolDefinition) -> bool {
-    find_binary(tool.binaries).is_some()
+    if find_binary(tool.binaries).is_some() {
+        return true;
+    }
+    if tool.id == "opencode" {
+        return opencode_installed_at_known_paths();
+    }
+    false
+}
+
+/// OpenCode 官方安装脚本默认落在 `~/.opencode/bin`，GUI 进程 PATH 常不含该目录。
+fn opencode_installed_at_known_paths() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    [
+        home.join(".opencode/bin/opencode"),
+        home.join(".local/bin/opencode"),
+        home.join("bin/opencode"),
+        home.join("go/bin/opencode"),
+    ]
+    .iter()
+    .any(|path| path.is_file())
 }
 
 pub async fn set_tool_config_enabled_async(
@@ -338,13 +377,19 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
                 } else {
                     crate::proxy::local_proxy_base(tool.id)
                 };
+                let platform = extend_opencode_platform_with_openai_models(
+                    platform.expect("opencode platform checked above"),
+                );
                 inject_opencode_grayscale_models(
                     tool,
                     target,
                     &config_path,
                     &local_base,
-                    platform.expect("opencode platform checked above"),
+                    &platform,
                 )?;
+                if let Err(error) = ensure_opencode_image_proxy_assets(&home, &platform) {
+                    eprintln!("OpenCode: 安装图片代理插件失败: {error}");
+                }
                 continue;
             }
 
@@ -449,10 +494,12 @@ fn collect_executable_search_dirs() -> Vec<PathBuf> {
 
     if let Some(home) = dirs::home_dir() {
         for suffix in [
+            ".opencode/bin",
             ".local/bin",
             ".cargo/bin",
             ".bun/bin",
             ".npm-global/bin",
+            "go/bin",
             "bin",
         ] {
             push(home.join(suffix));
@@ -529,9 +576,19 @@ fn append_nested_bin_dirs(base: &Path, suffix: &[&str], push: &mut impl FnMut(Pa
 
 #[cfg(unix)]
 fn find_binary_via_login_shell(name: &str) -> Option<String> {
+    resolve_binary_from_login_shell(&format!("command -v -- {name}"))
+}
+
+#[cfg(unix)]
+fn find_binary_via_which(name: &str) -> Option<String> {
+    resolve_binary_from_login_shell(&format!("which -- {name}"))
+}
+
+#[cfg(unix)]
+fn resolve_binary_from_login_shell(command: &str) -> Option<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let output = std::process::Command::new(&shell)
-        .args(["-l", "-c", &format!("command -v -- {name}")])
+        .args(["-l", "-c", command])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -542,11 +599,16 @@ fn find_binary_via_login_shell(name: &str) -> Option<String> {
         return None;
     }
     let candidate = PathBuf::from(&path);
-    if candidate.is_file() {
+    if candidate.is_file() || (candidate.is_symlink() && candidate.exists()) {
         Some(path)
     } else {
         None
     }
+}
+
+#[cfg(not(unix))]
+fn find_binary_via_which(_name: &str) -> Option<String> {
+    None
 }
 
 #[cfg(not(unix))]
@@ -575,6 +637,9 @@ fn find_binary(names: &[&str]) -> Option<String> {
             return Some(path.to_string_lossy().to_string());
         }
         if let Some(path) = find_binary_via_login_shell(name) {
+            return Some(path);
+        }
+        if let Some(path) = find_binary_via_which(name) {
             return Some(path);
         }
     }
@@ -1061,6 +1126,15 @@ fn build_opencode_provider_base_url(local_proxy_base: &str, base_path: &str) -> 
     format!("{local_proxy_base}{base_path}/v1")
 }
 
+/// 由 OpenCode 的本地代理 base 推导 Codex 的本地代理 base（同端口、不同 tool 前缀）。
+fn codex_local_proxy_base_from(opencode_local_base: &str) -> String {
+    let trimmed = opencode_local_base.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((prefix, _)) => format!("{prefix}/codex"),
+        None => trimmed.to_string(),
+    }
+}
+
 fn is_local_proxy_opencode_provider_base_url(url: &str) -> bool {
     let prefix = format!("http://{LOCAL_PROXY_HOST}:");
     let Some(rest) = url.strip_prefix(&prefix) else {
@@ -1069,7 +1143,7 @@ fn is_local_proxy_opencode_provider_base_url(url: &str) -> bool {
     let Some(path) = rest.split_once('/').map(|(_, path)| path) else {
         return false;
     };
-    path.starts_with("opencode/")
+    path.starts_with("opencode/") || path.starts_with("codex/")
 }
 
 /// 读取 OpenCode provider 节点上的 `options.baseURL`。
@@ -1151,11 +1225,31 @@ fn build_opencode_providers_config(
         let base_path = resolve_opencode_provider_base_path(&bifrost_provider, &models, platform);
         let api = resolve_opencode_provider_api(&base_path, &models);
         let npm = opencode_npm_for_api(&api);
-        let base_url = build_opencode_provider_base_url(local_proxy_base, &base_path);
+        // OpenAI 自定义 Provider 走 Codex 的本地代理前缀，由代理按 Codex 路由转发到 openai/v1。
+        let base_url = if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
+            format!("{}/v1", codex_local_proxy_base_from(local_proxy_base))
+        } else {
+            build_opencode_provider_base_url(local_proxy_base, &base_path)
+        };
 
         let mut model_entries = serde_json::Map::new();
         for model in &models {
-            model_entries.insert(model.id.clone(), build_opencode_model_entry(model));
+            let mut entry = build_opencode_model_entry(model);
+            // 自定义 Provider 默认无视觉能力，OpenCode 会在客户端剥离图片；
+            // OpenAI 模型需显式声明 attachment 与 modalities 才能收到粘贴的图片。
+            if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
+                if let Some(map) = entry.as_object_mut() {
+                    map.insert("attachment".to_string(), Value::Bool(true));
+                    map.insert(
+                        "modalities".to_string(),
+                        serde_json::json!({
+                            "input": ["text", "image"],
+                            "output": ["text"],
+                        }),
+                    );
+                }
+            }
+            model_entries.insert(model.id.clone(), entry);
         }
 
         providers.insert(
@@ -1381,6 +1475,125 @@ fn inject_opencode_grayscale_models(
 
     if let Some(model) = resolve_opencode_default_model(platform) {
         root.insert("model".to_string(), Value::String(model));
+    }
+
+    let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    write_config(config_path, &new_content)
+}
+
+fn opencode_openai_model_entry(model_id: &str) -> GrayscaleModelEntry {
+    GrayscaleModelEntry {
+        id: model_id.to_string(),
+        provider: OPENCODE_OPENAI_PROVIDER_KEY.to_string(),
+        key_id: String::new(),
+        key_name: OPENCODE_OPENAI_PROVIDER_KEY.to_string(),
+        source: "zwitch-openai".to_string(),
+        api: Some("openai-responses".to_string()),
+        base_path: Some("/openai".to_string()),
+        context_window: None,
+        max_tokens: None,
+    }
+}
+
+/// 在灰度平台模型之外补充 OpenAI 自定义 Provider 的模型（gpt-5.5 / gpt-5.4 / gpt-5.4-mini）。
+fn extend_opencode_platform_with_openai_models(
+    platform: &GrayscalePlatformModels,
+) -> GrayscalePlatformModels {
+    let mut extended = platform.clone();
+    let existing: HashSet<String> = extended
+        .additional_models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect();
+    for model_id in OPENCODE_OPENAI_MODEL_IDS {
+        if existing.contains(*model_id) {
+            continue;
+        }
+        extended
+            .additional_models
+            .push(opencode_openai_model_entry(model_id));
+    }
+    extended
+}
+
+/// 收集不具备图片识别能力的模型（除 OpenAI Provider 外的注入模型），格式为 `provider/model`。
+fn opencode_image_incapable_models(platform: &GrayscalePlatformModels) -> Vec<String> {
+    let mut models = Vec::new();
+    for (_, group) in group_opencode_models_by_key(&platform.additional_models) {
+        let provider_key = opencode_provider_key_from_models(&group);
+        if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
+            continue;
+        }
+        for model in &group {
+            models.push(format!("{provider_key}/{}", model.id));
+        }
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn build_opencode_image_proxy_config(platform: &GrayscalePlatformModels) -> Value {
+    serde_json::json!({
+        "imageIncapableModels": opencode_image_incapable_models(platform),
+        "imageReaderModel": {
+            "providerID": OPENCODE_OPENAI_PROVIDER_KEY,
+            "modelID": OPENCODE_IMAGE_READER_MODEL_ID,
+        },
+        "analysisPrompt": OPENCODE_IMAGE_ANALYSIS_PROMPT,
+    })
+}
+
+/// 确保 OpenCode 图片代理插件及其配置文件存在；缺失时创建，已存在则不覆盖。
+fn ensure_opencode_image_proxy_assets(
+    home: &Path,
+    platform: &GrayscalePlatformModels,
+) -> Result<(), String> {
+    let plugin_path = home.join(OPENCODE_IMAGE_PROXY_PLUGIN_RELATIVE);
+    if !plugin_path.exists() {
+        write_config(&plugin_path, OPENCODE_IMAGE_PROXY_PLUGIN_SOURCE)?;
+        eprintln!("OpenCode: 已安装图片代理插件 {}", plugin_path.display());
+    }
+
+    let config_path = home.join(OPENCODE_IMAGE_PROXY_CONFIG_RELATIVE);
+    if !config_path.exists() {
+        let config = build_opencode_image_proxy_config(platform);
+        let content =
+            serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+        write_config(&config_path, &content)?;
+        eprintln!(
+            "OpenCode: 已生成图片代理插件配置 {}",
+            config_path.display()
+        );
+    } else {
+        migrate_opencode_image_proxy_reader_provider(&config_path)?;
+    }
+
+    Ok(())
+}
+
+/// 将旧版图片代理配置中的 `imageReaderModel.providerID = "openai"` 迁移到新 Provider key。
+fn migrate_opencode_image_proxy_reader_provider(config_path: &Path) -> Result<(), String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|e| format!("读取图片代理配置失败: {e}"))?;
+    let Ok(mut value) = serde_json::from_str::<Value>(&content) else {
+        return Ok(());
+    };
+
+    let needs_migration = value
+        .get("imageReaderModel")
+        .and_then(|reader| reader.get("providerID"))
+        .and_then(Value::as_str)
+        .is_some_and(|provider| provider == OPENCODE_OPENAI_LEGACY_PROVIDER_KEY);
+    if !needs_migration {
+        return Ok(());
+    }
+
+    if let Some(provider) = value
+        .get_mut("imageReaderModel")
+        .and_then(|reader| reader.get_mut("providerID"))
+    {
+        *provider = Value::String(OPENCODE_OPENAI_PROVIDER_KEY.to_string());
     }
 
     let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
@@ -2240,6 +2453,154 @@ fn write_config(path: &Path, content: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn grayscale_model(id: &str, provider: &str, key_name: &str) -> GrayscaleModelEntry {
+        GrayscaleModelEntry {
+            id: id.into(),
+            provider: provider.into(),
+            key_id: String::new(),
+            key_name: key_name.into(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+            context_window: None,
+            max_tokens: None,
+        }
+    }
+
+    fn opencode_platform(models: Vec<GrayscaleModelEntry>) -> GrayscalePlatformModels {
+        GrayscalePlatformModels {
+            id: "opencode".into(),
+            label: "OpenCode".into(),
+            base_path: "/openai".into(),
+            injection_mode: "append".into(),
+            models: vec![],
+            additional_models: models,
+        }
+    }
+
+    #[test]
+    fn extend_opencode_platform_adds_openai_models() {
+        let platform = opencode_platform(vec![grayscale_model(
+            "claude-mythos-preview",
+            "claude",
+            "claude",
+        )]);
+        let extended = extend_opencode_platform_with_openai_models(&platform);
+        let ids: Vec<_> = extended
+            .additional_models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(ids.contains(&"gpt-5.5"));
+        assert!(ids.contains(&"gpt-5.4"));
+        assert!(ids.contains(&"gpt-5.4-mini"));
+        assert_eq!(extended.additional_models.len(), 4);
+    }
+
+    #[test]
+    fn extend_opencode_platform_deduplicates_by_model_id() {
+        let platform =
+            opencode_platform(vec![grayscale_model("gpt-5.4", "openai", "openai")]);
+        let extended = extend_opencode_platform_with_openai_models(&platform);
+        let count = extended
+            .additional_models
+            .iter()
+            .filter(|model| model.id == "gpt-5.4")
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn image_incapable_models_excludes_openai_provider() {
+        let platform = opencode_platform(vec![
+            grayscale_model("claude-mythos-preview-fast", "claude", "claude"),
+            grayscale_model("claude-mythos-preview", "claude", "claude"),
+        ]);
+        let extended = extend_opencode_platform_with_openai_models(&platform);
+        let incapable = opencode_image_incapable_models(&extended);
+        assert_eq!(
+            incapable,
+            vec![
+                "claude/claude-mythos-preview".to_string(),
+                "claude/claude-mythos-preview-fast".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn zwitch_openai_provider_uses_codex_local_proxy_base() {
+        let platform = opencode_platform(vec![grayscale_model(
+            "claude-mythos-preview",
+            "claude",
+            "claude",
+        )]);
+        let extended = extend_opencode_platform_with_openai_models(&platform);
+        let (providers, managed_keys) =
+            build_opencode_providers_config("http://127.0.0.1:51805/opencode", &extended);
+        let providers = providers.as_object().unwrap();
+
+        let openai = providers
+            .get(OPENCODE_OPENAI_PROVIDER_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            openai
+                .get("options")
+                .and_then(|options| options.get("baseURL"))
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:51805/codex/v1")
+        );
+        let models = openai.get("models").unwrap().as_object().unwrap();
+        assert!(models.contains_key("gpt-5.5"));
+        assert!(models.contains_key("gpt-5.4"));
+        assert!(models.contains_key("gpt-5.4-mini"));
+
+        // OpenAI 模型必须声明视觉能力，否则 OpenCode 会在客户端剥离图片。
+        let gpt54 = models.get("gpt-5.4").unwrap();
+        assert_eq!(gpt54.get("attachment").and_then(Value::as_bool), Some(true));
+        let input_modalities = gpt54["modalities"]["input"].as_array().unwrap();
+        assert!(input_modalities.iter().any(|v| v == "image"));
+
+        // 灰度 Provider 仍走 opencode 前缀。
+        let claude = providers.get("claude").unwrap();
+        assert_eq!(
+            claude
+                .get("options")
+                .and_then(|options| options.get("baseURL"))
+                .and_then(Value::as_str),
+            Some("http://127.0.0.1:51805/opencode/openai/v1")
+        );
+
+        // Codex 前缀的 baseURL 也要被识别为受管 Provider，确保还原时能移除。
+        assert!(managed_keys.contains(&OPENCODE_OPENAI_PROVIDER_KEY.to_string()));
+        assert!(is_local_proxy_opencode_provider_base_url(
+            "http://127.0.0.1:51805/codex/v1"
+        ));
+    }
+
+    #[test]
+    fn image_proxy_config_points_reader_to_openai_gpt54() {
+        let platform = opencode_platform(vec![grayscale_model(
+            "claude-mythos-preview",
+            "claude",
+            "claude",
+        )]);
+        let config = build_opencode_image_proxy_config(&platform);
+        assert_eq!(
+            config["imageReaderModel"]["providerID"].as_str(),
+            Some("zwitch-openai")
+        );
+        assert_eq!(
+            config["imageReaderModel"]["modelID"].as_str(),
+            Some("gpt-5.4")
+        );
+        assert!(config["analysisPrompt"]
+            .as_str()
+            .unwrap()
+            .starts_with("The user has pasted an image"));
+    }
+
     #[test]
     fn cli_tool_status_reports_install_metadata() {
         let tool = &TOOLS[0];
@@ -2488,6 +2849,32 @@ base_url = "http://old.example/codex"
         }
         assert!(
             find_binary(&["codex"]).is_some() || find_binary(&["claude"]).is_some()
+        );
+    }
+
+    #[test]
+    fn executable_search_dirs_include_opencode_install_path() {
+        let home = dirs::home_dir().expect("home dir");
+        let dirs = collect_executable_search_dirs();
+        assert!(
+            dirs.iter().any(|dir| dir == &home.join(".opencode/bin")),
+            "expected ~/.opencode/bin in executable search dirs"
+        );
+    }
+
+    #[test]
+    fn opencode_install_detection_matches_tool_definition() {
+        let tool = TOOLS
+            .iter()
+            .find(|tool| tool.id == "opencode")
+            .expect("opencode tool");
+        let installed = is_tool_installed(tool);
+        let via_paths = opencode_installed_at_known_paths();
+        let via_binary = find_binary(tool.binaries).is_some();
+        assert_eq!(
+            installed,
+            via_paths || via_binary,
+            "is_tool_installed should combine PATH lookup and known install paths"
         );
     }
 
