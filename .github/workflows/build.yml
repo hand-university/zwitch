@@ -69,6 +69,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download frontend dist
         uses: actions/download-artifact@v4
@@ -201,6 +203,17 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npm run tauri build -- --config '{"build":{"beforeBuildCommand":""}}' ${{ matrix.args }}
 
+      - name: Generate release changelog
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: changelog
+        run: |
+          BODY="$(bash scripts/generate-release-changelog.sh "${GITHUB_REF_NAME}")"
+          {
+            echo "body<<EOF"
+            printf '%s\n' "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: tauri-apps/tauri-action@v0
@@ -218,9 +231,8 @@ jobs:
           tauriScript: npm run tauri
           tagName: ${{ github.ref_name }}
           releaseName: ZWitch ${{ github.ref_name }}
-          releaseBody: |
-            Desktop builds for Linux x64, macOS arm64/x64, and Windows x64.
-          generateReleaseNotes: true
+          releaseBody: ${{ steps.changelog.outputs.body }}
+          generateReleaseNotes: false
           includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
