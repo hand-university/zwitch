@@ -206,7 +206,7 @@ pub fn tool_ids() -> Vec<&'static str> {
 }
 
 pub fn is_tool_config_enabled(settings: &StoredSettings, tool_id: &str) -> bool {
-    settings.tool_switches.get(tool_id).copied().unwrap_or(true)
+    settings.tool_switches.get(tool_id).copied().unwrap_or(false)
 }
 
 fn tool_should_inject(settings: &StoredSettings, tool: &ToolDefinition) -> bool {
@@ -248,11 +248,9 @@ pub async fn set_tool_config_enabled_async(
     }
 
     let mut settings = load_settings(app)?;
-    if enabled {
-        settings.tool_switches.remove(tool_id);
-    } else {
-        settings.tool_switches.insert(tool_id.to_string(), false);
-    }
+    settings
+        .tool_switches
+        .insert(tool_id.to_string(), enabled);
     crate::store::save_settings(app, &settings)?;
     apply_config_injection_async(app).await?;
     Ok(())
@@ -2671,22 +2669,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_config_defaults_to_enabled() {
+    fn tool_config_defaults_to_disabled() {
         let settings = StoredSettings::default();
-        assert!(is_tool_config_enabled(&settings, "codex"));
-        assert!(is_tool_config_enabled(&settings, "claude"));
+        assert!(!is_tool_config_enabled(&settings, "codex"));
+        assert!(!is_tool_config_enabled(&settings, "claude"));
         assert!(!tool_should_inject(&settings, &TOOLS[0]));
     }
 
     #[test]
-    fn tool_config_switch_disables_injection() {
+    fn tool_config_switch_persists_enabled_state() {
         let mut settings = StoredSettings {
             proxy_enabled: true,
-            tool_switches: HashMap::from([(String::from("codex"), false)]),
+            tool_switches: HashMap::from([
+                (String::from("codex"), true),
+                (String::from("claude"), false),
+            ]),
         };
-        assert!(!is_tool_config_enabled(&settings, "codex"));
-        assert!(is_tool_config_enabled(&settings, "claude"));
-        assert!(!tool_should_inject(&settings, &TOOLS[0]));
+        assert!(is_tool_config_enabled(&settings, "codex"));
+        assert!(!is_tool_config_enabled(&settings, "claude"));
+        assert!(tool_should_inject(&settings, &TOOLS[0]));
+        assert!(!tool_should_inject(&settings, &TOOLS[1]));
+
+        settings.tool_switches.insert(String::from("claude"), true);
         assert!(tool_should_inject(&settings, &TOOLS[1]));
     }
 
