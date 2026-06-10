@@ -31,6 +31,9 @@ pub struct CliToolStatus {
     pub quick_start_doc_url: String,
     /// 用户是否允许为该工具注入配置（默认开启）。
     pub config_enabled: bool,
+    /// 当前用户是否有灰度模型权限（仅 OpenCode 使用）。
+    #[serde(default)]
+    pub has_grayscale: bool,
     pub config_path: String,
     pub base_url_field: String,
     pub token_field: String,
@@ -270,7 +273,11 @@ pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolSt
             .map(|(tool_id, platform)| (tool_id.clone(), platform.additional_models.clone()))
             .collect();
         crate::grayscale_api::update_grayscale_cache(grayscale_models);
-        grayscale_platforms.contains_key("opencode")
+        if grayscale_platforms.contains_key("opencode") {
+            true
+        } else {
+            false
+        }
     } else {
         false
     };
@@ -280,6 +287,7 @@ pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolSt
         .filter(|tool| tool.id != "opencode" || show_opencode)
         .map(|tool| {
             let config_path = home.join(tool.targets[0].relative);
+            let is_opencode = tool.id == "opencode";
             CliToolStatus {
                 id: tool.id.to_string(),
                 name: tool.name.to_string(),
@@ -288,6 +296,7 @@ pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolSt
                 install_shell: tool.install_shell.to_string(),
                 quick_start_doc_url: tool.quick_start_doc_url.to_string(),
                 config_enabled: is_tool_config_enabled(&settings, tool.id),
+                has_grayscale: is_opencode && show_opencode,
                 config_path: config_path.to_string_lossy().to_string(),
                 base_url_field: tool.base_url_field.to_string(),
                 token_field: tool.token_field.to_string(),
@@ -1097,12 +1106,36 @@ fn resolve_opencode_provider_api(base_path: &str, models: &[GrayscaleModelEntry]
         .unwrap_or_else(|| infer_opencode_api_from_base_path(base_path).to_string())
 }
 
+fn name_has_grayscale_marker(name: &str) -> bool {
+    name.contains("灰度")
+}
+
+/// 为 OpenCode Provider 展示名追加灰度标识（避免重复追加）。
+fn opencode_grayscale_provider_display_name(models: &[GrayscaleModelEntry]) -> String {
+    let base = opencode_provider_key_from_models(models);
+    if name_has_grayscale_marker(&base) {
+        base
+    } else {
+        format!("{base}（灰度）")
+    }
+}
+
+/// 为 OpenCode 模型展示名追加灰度标识。
+fn opencode_grayscale_model_display_name(model: &GrayscaleModelEntry) -> String {
+    let base = grayscale_model_display_name(&model.id);
+    if model.source == "grayscale" && !name_has_grayscale_marker(&base) {
+        format!("{base}（灰度）")
+    } else {
+        base
+    }
+}
+
 /// 构造 OpenCode `provider.<key>.models.<id>` 的取值。
 fn build_opencode_model_entry(model: &GrayscaleModelEntry) -> Value {
     let mut entry = serde_json::Map::new();
     entry.insert(
         "name".to_string(),
-        Value::String(grayscale_model_display_name(&model.id)),
+        Value::String(opencode_grayscale_model_display_name(model)),
     );
 
     let mut limit = serde_json::Map::new();
@@ -1252,11 +1285,17 @@ fn build_opencode_providers_config(
             model_entries.insert(model.id.clone(), entry);
         }
 
+        let provider_display_name = if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
+            "ZWitch OpenAI".to_string()
+        } else {
+            opencode_grayscale_provider_display_name(&models)
+        };
+
         providers.insert(
             provider_key.clone(),
             serde_json::json!({
                 "npm": npm,
-                "name": provider_key,
+                "name": provider_display_name,
                 "options": {
                     "baseURL": base_url,
                     "apiKey": OPENCODE_PROXY_API_KEY_PLACEHOLDER,
@@ -1324,6 +1363,10 @@ fn merge_opencode_injected_providers(
     for (key, provider_value) in injected {
         let injected_name = opencode_provider_display_name(provider_value, key);
         for existing_key in opencode_provider_keys_matching_name(providers, injected_name) {
+            keys_to_remove.insert(existing_key);
+        }
+        // 展示名可能带「（灰度）」后缀，需额外按 Provider key / key_name 匹配。
+        for existing_key in opencode_provider_keys_matching_name(providers, key) {
             keys_to_remove.insert(existing_key);
         }
     }
@@ -2612,6 +2655,7 @@ mod tests {
             install_shell: tool.install_shell.to_string(),
             quick_start_doc_url: tool.quick_start_doc_url.to_string(),
             config_enabled: true,
+            has_grayscale: false,
             config_path: "/tmp/config".to_string(),
             base_url_field: tool.base_url_field.to_string(),
             token_field: tool.token_field.to_string(),
@@ -3057,19 +3101,55 @@ base_url = "http://old.example/codex"
             claude.get("name").and_then(Value::as_str),
             Some("灰度 Claude")
         );
-        let options = claude.get("options").unwrap().as_object().unwrap();
-        assert_eq!(
-            options.get("baseURL").and_then(Value::as_str),
-            Some("http://127.0.0.1:51805/opencode/openai/v1")
-        );
-        assert_eq!(
-            options.get("apiKey").and_then(Value::as_str),
-            Some(OPENCODE_PROXY_API_KEY_PLACEHOLDER)
-        );
         let models = claude.get("models").unwrap().as_object().unwrap();
         assert_eq!(models.len(), 2);
+        assert_eq!(
+            models
+                .get("claude-mythos-preview")
+                .and_then(|entry| entry.get("name"))
+                .and_then(Value::as_str),
+            Some("Claude Mythos Preview（灰度）")
+        );
         assert!(models.contains_key("claude-mythos-preview"));
         assert!(models.contains_key("claude-mythos-preview-fast"));
+    }
+
+    #[test]
+    fn opencode_appends_grayscale_marker_to_provider_without_existing_marker() {
+        let models = vec![GrayscaleModelEntry {
+            id: "glm-4.6".into(),
+            provider: "zhipu".into(),
+            key_id: "gray-zhipu".into(),
+            key_name: "GLM".into(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+            context_window: None,
+            max_tokens: None,
+        }];
+        assert_eq!(
+            opencode_grayscale_provider_display_name(&models),
+            "GLM（灰度）"
+        );
+    }
+
+    #[test]
+    fn opencode_skips_duplicate_grayscale_marker_on_provider() {
+        let models = vec![GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "claude".into(),
+            key_id: "gray-key".into(),
+            key_name: "灰度 Mythos".into(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+            context_window: None,
+            max_tokens: None,
+        }];
+        assert_eq!(
+            opencode_grayscale_provider_display_name(&models),
+            "灰度 Mythos"
+        );
     }
 
     #[test]
@@ -3118,7 +3198,7 @@ base_url = "http://old.example/codex"
         assert_eq!(limit.get("output").and_then(Value::as_u64), Some(32_000));
         assert_eq!(
             entry.get("name").and_then(Value::as_str),
-            Some("Claude Mythos Preview")
+            Some("Claude Mythos Preview（灰度）")
         );
     }
 

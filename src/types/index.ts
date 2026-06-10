@@ -15,6 +15,7 @@ export interface CliToolStatus {
   install_shell: string;
   quick_start_doc_url: string;
   config_enabled: boolean;
+  has_grayscale?: boolean;
 }
 
 export type AppPage =

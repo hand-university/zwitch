@@ -1,4 +1,6 @@
-import { Check, Copy, ExternalLink, Zap } from "lucide-react";
+import { useState } from "react";
+import { BookOpen, Check, Copy, ExternalLink, Zap } from "lucide-react";
+import { GrayscaleModelsDialog } from "@/components/GrayscaleModelsDialog";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -38,6 +40,7 @@ export function QuickStartPage({
   onProxyToggle,
   onToolConfigToggle,
 }: QuickStartPageProps) {
+  const [grayscaleDocOpen, setGrayscaleDocOpen] = useState(false);
   const enabledToolCount = tools.filter(
     (tool) => tool.supported && tool.config_enabled,
   ).length;
@@ -137,6 +140,11 @@ export function QuickStartPage({
                   <div className="min-w-0 flex-1 space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-medium">{tool.name}</span>
+                      {tool.has_grayscale ? (
+                        <span className="inline-flex items-center rounded-full bg-violet-500/10 px-2 py-0.5 text-xs font-medium text-violet-700 dark:text-violet-400">
+                          灰度
+                        </span>
+                      ) : null}
                       {tool.installed ? (
                         <span className="inline-flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
                           <Check className="h-3.5 w-3.5" />
@@ -168,6 +176,17 @@ export function QuickStartPage({
                           <Copy />
                           复制
                         </Button>
+                        {tool.has_grayscale ? (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => setGrayscaleDocOpen(true)}
+                            className="inline-flex items-center gap-1 text-xs text-primary hover:underline disabled:opacity-50"
+                          >
+                            <BookOpen className="h-3 w-3 shrink-0" />
+                            灰度模型使用说明
+                          </button>
+                        ) : null}
                       </div>
                     ) : (
                       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -187,6 +206,17 @@ export function QuickStartPage({
                           <ExternalLink className="h-3 w-3 shrink-0" />
                           快速开始文档
                         </button>
+                        {tool.has_grayscale ? (
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => setGrayscaleDocOpen(true)}
+                            className="inline-flex items-center gap-1 text-xs text-primary hover:underline disabled:opacity-50"
+                          >
+                            <BookOpen className="h-3 w-3 shrink-0" />
+                            灰度模型使用说明
+                          </button>
+                        ) : null}
                       </div>
                     )}
                   </div>
@@ -215,6 +245,11 @@ export function QuickStartPage({
           配置变更后请重启对应工具使更改生效
         </p>
       </div>
+
+      <GrayscaleModelsDialog
+        open={grayscaleDocOpen}
+        onClose={() => setGrayscaleDocOpen(false)}
+      />
     </div>
   );
 }
