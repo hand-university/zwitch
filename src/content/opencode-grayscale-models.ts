@@ -8,7 +8,7 @@ export interface GrayscaleModelGuide {
   opencodeModel: string;
 }
 
-export const OPENCODE_GRAYSCALE_PROVIDER = "灰度 Mythos";
+export const OPENCODE_GRAYSCALE_PROVIDER = "灰度";
 
 export const OPENCODE_GRAYSCALE_MODELS: GrayscaleModelGuide[] = [
   {
@@ -51,7 +51,7 @@ export const OPENCODE_GRAYSCALE_MODELS: GrayscaleModelGuide[] = [
 export const OPENCODE_GRAYSCALE_USAGE_STEPS = [
   "在 ZWitch 登录账号并开启「启用代理」，确保 OpenCode 开关为开启状态",
   "安装 OpenCode 后重启终端，执行 opencode 启动",
-  "在模型选择界面切换到带「灰度」标识的 Provider（灰度 Mythos）",
+  "在模型选择界面切换到 Provider「灰度」",
   "选择上方任一 Mythos 模型开始对话；默认已选中 Fast 版本",
   "粘贴图片时，ZWitch 会自动通过图片代理插件辅助不支持视觉的模型",
 ];
