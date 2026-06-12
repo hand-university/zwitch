@@ -154,6 +154,8 @@ const OPENCODE_OPENAI_MODEL_IDS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini
 const OPENCODE_IMAGE_READER_MODEL_ID: &str = "gpt-5.4";
 /// 图片代理插件的默认分析提示词。
 const OPENCODE_IMAGE_ANALYSIS_PROMPT: &str = "The user has pasted an image into their chat. Describe what you see as if you are directly observing the image. Be thorough but concise. Include:\n- All visible elements (objects, text, UI elements, people, etc.)\n- Exact transcription of any text\n- The context and purpose of the image\n- Any relevant technical details\n\nDescribe it naturally, as if explaining to someone what you're looking at right now.";
+/// 注入 OpenCode 的灰度 Provider key 与展示名，不随 API Key 名称变化。
+const OPENCODE_GRAYSCALE_PROVIDER_KEY: &str = "灰度";
 
 const TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -217,9 +219,277 @@ fn is_tool_installed(tool: &ToolDefinition) -> bool {
     if find_binary(tool.binaries).is_some() {
         return true;
     }
-    if tool.id == "opencode" {
-        return opencode_installed_at_known_paths();
+    tool_installed_at_known_paths(tool.id)
+}
+
+fn tool_installed_at_known_paths(tool_id: &str) -> bool {
+    match tool_id {
+        "claude" => claude_installed_at_known_paths(),
+        "codex" => codex_installed_at_known_paths(),
+        "opencode" => opencode_installed_at_known_paths(),
+        _ => false,
     }
+}
+
+fn path_is_existing_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn path_is_existing_dir(path: &Path) -> bool {
+    path.is_dir()
+}
+
+fn any_existing_file(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path_is_existing_file(path))
+}
+
+fn any_existing_dir(paths: &[PathBuf]) -> bool {
+    paths.iter().any(|path| path_is_existing_dir(path))
+}
+
+fn cli_candidate_paths(home: &Path, binary: &str) -> Vec<PathBuf> {
+    let mut paths = vec![
+        home.join(".local/bin").join(binary),
+        home.join("bin").join(binary),
+    ];
+    #[cfg(windows)]
+    {
+        paths.push(home.join(".local/bin").join(format!("{binary}.exe")));
+        paths.push(home.join("bin").join(format!("{binary}.exe")));
+    }
+    paths
+}
+
+#[cfg(unix)]
+fn unix_system_cli_paths(binary: &str) -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(format!("/usr/bin/{binary}")),
+        PathBuf::from(format!("/usr/local/bin/{binary}")),
+    ]
+}
+
+#[cfg(not(unix))]
+fn unix_system_cli_paths(_binary: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn windows_local_programs(relative: &str) -> Option<PathBuf> {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|root| PathBuf::from(root).join("Programs").join(relative))
+}
+
+#[cfg(windows)]
+fn windows_program_files(relative: &str) -> Option<PathBuf> {
+    std::env::var("ProgramFiles")
+        .ok()
+        .map(|root| PathBuf::from(root).join(relative))
+}
+
+#[cfg(windows)]
+fn windows_claude_msix_installed() -> bool {
+    let Ok(local_app_data) = std::env::var("LOCALAPPDATA") else {
+        return false;
+    };
+    let packages = PathBuf::from(local_app_data).join("Packages");
+    let Ok(entries) = fs::read_dir(packages) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("Claude_")
+            && entry.path().is_dir()
+    })
+}
+
+#[cfg(not(windows))]
+fn windows_local_programs(_relative: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(windows))]
+fn windows_program_files(_relative: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(windows))]
+fn windows_claude_msix_installed() -> bool {
+    false
+}
+
+/// Electron/Tauri 桌面端常见数据目录名（跨平台）。
+fn electron_app_data_installed(home: &Path, app_id: &str) -> bool {
+    let mut candidates = vec![
+        home.join(".config").join(app_id),
+        home.join(".local/share").join(app_id),
+    ];
+    if let Some(data_dir) = dirs::data_dir() {
+        candidates.push(data_dir.join(app_id));
+    }
+    if let Some(data_local_dir) = dirs::data_local_dir() {
+        candidates.push(data_local_dir.join(app_id));
+    }
+    any_existing_dir(&candidates)
+}
+
+/// 在 `base/<version>/...suffix` 下查找可执行文件（桌面端常按版本号分目录发布）。
+fn any_file_in_versioned_subdirs(base: &Path, suffix: &[&str]) -> bool {
+    let Ok(entries) = fs::read_dir(base) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let mut path = entry.path();
+        for part in suffix {
+            path = path.join(part);
+        }
+        if path_is_existing_file(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Claude Desktop 内置 CLI 落在 Application Support；独立 CLI 也可能不在 GUI PATH 中。
+fn claude_installed_at_known_paths() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+
+    if any_existing_file(&cli_candidate_paths(&home, "claude")) {
+        return true;
+    }
+
+    if any_nonempty_file_in_dir(&home.join(".local/share/claude/versions")) {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if path_is_existing_dir(Path::new("/Applications/Claude.app")) {
+            return true;
+        }
+        let claude_code_base = home.join("Library/Application Support/Claude/claude-code");
+        if any_file_in_versioned_subdirs(&claude_code_base, &["claude"]) {
+            return true;
+        }
+        if any_file_in_versioned_subdirs(
+            &claude_code_base,
+            &["claude.app", "Contents", "MacOS", "claude"],
+        ) {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if windows_claude_msix_installed() {
+            return true;
+        }
+        if let Some(data_dir) = dirs::data_dir() {
+            if path_is_existing_dir(&data_dir.join("Claude")) {
+                return true;
+            }
+            let claude_code_base = data_dir.join("Claude").join("claude-code");
+            if any_file_in_versioned_subdirs(&claude_code_base, &["claude.exe"])
+                || any_file_in_versioned_subdirs(&claude_code_base, &["claude"])
+            {
+                return true;
+            }
+        }
+        for relative in ["Claude/Claude.exe", "Claude Code/Claude.exe"] {
+            if let Some(path) = windows_local_programs(relative) {
+                if path_is_existing_file(&path) {
+                    return true;
+                }
+            }
+            if let Some(path) = windows_program_files(relative) {
+                if path_is_existing_file(&path) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if any_existing_file(&unix_system_cli_paths("claude")) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn any_nonempty_file_in_dir(base: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(base) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if entry.metadata().map(|meta| meta.len() > 0).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Codex 桌面端 bundle 内携带 CLI；仅装 App 时 PATH 里可能没有 `codex`。
+fn codex_installed_at_known_paths() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+
+    if any_existing_file(&cli_candidate_paths(&home, "codex")) {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if path_is_existing_dir(Path::new("/Applications/Codex.app")) {
+            return true;
+        }
+        if path_is_existing_file(Path::new(
+            "/Applications/Codex.app/Contents/Resources/codex",
+        )) {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if electron_app_data_installed(&home, "com.openai.codex") {
+            return true;
+        }
+        for relative in ["Codex/Codex.exe", "OpenAI/Codex/Codex.exe"] {
+            if let Some(path) = windows_local_programs(relative) {
+                if path_is_existing_file(&path) {
+                    return true;
+                }
+            }
+            if let Some(path) = windows_program_files(relative) {
+                if path_is_existing_file(&path) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if any_existing_file(&unix_system_cli_paths("codex")) {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -228,14 +498,76 @@ fn opencode_installed_at_known_paths() -> bool {
     let Some(home) = dirs::home_dir() else {
         return false;
     };
-    [
+
+    let mut cli_paths = cli_candidate_paths(&home, "opencode");
+    cli_paths.extend([
         home.join(".opencode/bin/opencode"),
-        home.join(".local/bin/opencode"),
-        home.join("bin/opencode"),
         home.join("go/bin/opencode"),
-    ]
-    .iter()
-    .any(|path| path.is_file())
+    ]);
+    if any_existing_file(&cli_paths) {
+        return true;
+    }
+
+    if electron_app_data_installed(&home, "ai.opencode.desktop") {
+        return true;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if path_is_existing_dir(Path::new("/Applications/OpenCode.app")) {
+            return true;
+        }
+        for relative in [
+            "Contents/MacOS/opencode-cli",
+            "Contents/Resources/opencode-cli",
+        ] {
+            let sidecar = Path::new("/Applications/OpenCode.app").join(relative);
+            if path_is_existing_file(&sidecar) {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        for relative in [
+            "OpenCode/OpenCode.exe",
+            "opencode-desktop/OpenCode.exe",
+            "OpenCode Desktop/OpenCode.exe",
+        ] {
+            if let Some(path) = windows_local_programs(relative) {
+                if path_is_existing_file(&path) {
+                    return true;
+                }
+            }
+            if let Some(path) = windows_program_files(relative) {
+                if path_is_existing_file(&path) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut linux_paths = unix_system_cli_paths("opencode");
+        linux_paths.extend(unix_system_cli_paths("opencode-cli"));
+        linux_paths.extend([
+            PathBuf::from("/opt/OpenCode/@opencode-aidesktop"),
+            PathBuf::from("/opt/opencode/bin/opencode"),
+            PathBuf::from("/opt/opencode/bin/opencode-cli"),
+        ]);
+        if any_existing_file(&linux_paths) {
+            return true;
+        }
+        if path_is_existing_dir(Path::new("/opt/OpenCode"))
+            || path_is_existing_dir(Path::new("/opt/opencode"))
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub async fn set_tool_config_enabled_async(
@@ -1034,14 +1366,6 @@ fn inject_values(
     write_config(config_path, &new_content)
 }
 
-fn opencode_provider_id(provider: &str) -> String {
-    if provider.is_empty() {
-        "openai".to_string()
-    } else {
-        provider.to_string()
-    }
-}
-
 fn normalize_opencode_base_path(base_path: &str) -> String {
     let trimmed = base_path.trim();
     if trimmed.is_empty() {
@@ -1108,14 +1432,13 @@ fn name_has_grayscale_marker(name: &str) -> bool {
     name.contains("灰度")
 }
 
-/// 为 OpenCode Provider 展示名追加灰度标识（避免重复追加）。
-fn opencode_grayscale_provider_display_name(models: &[GrayscaleModelEntry]) -> String {
-    let base = opencode_provider_key_from_models(models);
-    if name_has_grayscale_marker(&base) {
-        base
-    } else {
-        format!("{base}（灰度）")
-    }
+fn is_opencode_zwitch_openai_model(model: &GrayscaleModelEntry) -> bool {
+    model.key_name == OPENCODE_OPENAI_PROVIDER_KEY || model.source == "zwitch-openai"
+}
+
+/// OpenCode 灰度 Provider 统一展示为「灰度」。
+fn opencode_grayscale_provider_display_name(_models: &[GrayscaleModelEntry]) -> String {
+    OPENCODE_GRAYSCALE_PROVIDER_KEY.to_string()
 }
 
 /// 为 OpenCode 模型展示名追加灰度标识。
@@ -1191,14 +1514,10 @@ fn group_opencode_models_by_key(
 ) -> HashMap<String, Vec<GrayscaleModelEntry>> {
     let mut grouped: HashMap<String, Vec<GrayscaleModelEntry>> = HashMap::new();
     for model in models {
-        let group_key = if !model.key_id.is_empty() {
-            model.key_id.clone()
-        } else if !model.key_name.is_empty() {
-            model.key_name.clone()
-        } else if !model.provider.is_empty() {
-            model.provider.clone()
+        let group_key = if is_opencode_zwitch_openai_model(model) {
+            OPENCODE_OPENAI_PROVIDER_KEY.to_string()
         } else {
-            "openai".to_string()
+            OPENCODE_GRAYSCALE_PROVIDER_KEY.to_string()
         };
         grouped.entry(group_key).or_default().push(model.clone());
     }
@@ -1206,32 +1525,14 @@ fn group_opencode_models_by_key(
 }
 
 fn opencode_provider_key_from_models(models: &[GrayscaleModelEntry]) -> String {
-    models
+    if models
         .iter()
-        .find_map(|model| {
-            if model.key_name.is_empty() {
-                None
-            } else {
-                Some(model.key_name.clone())
-            }
-        })
-        .or_else(|| {
-            models.first().and_then(|model| {
-                if model.key_id.is_empty() {
-                    None
-                } else {
-                    Some(model.key_id.clone())
-                }
-            })
-        })
-        .unwrap_or_else(|| {
-            opencode_provider_id(
-                models
-                    .first()
-                    .map(|model| model.provider.as_str())
-                    .unwrap_or("openai"),
-            )
-        })
+        .any(is_opencode_zwitch_openai_model)
+    {
+        OPENCODE_OPENAI_PROVIDER_KEY.to_string()
+    } else {
+        OPENCODE_GRAYSCALE_PROVIDER_KEY.to_string()
+    }
 }
 
 fn bifrost_provider_for_opencode_models(models: &[GrayscaleModelEntry]) -> String {
@@ -1608,9 +1909,79 @@ fn ensure_opencode_image_proxy_assets(
         );
     } else {
         migrate_opencode_image_proxy_reader_provider(&config_path)?;
+        sync_opencode_image_proxy_incapable_models(&config_path, platform)?;
     }
 
     Ok(())
+}
+
+/// 同步图片代理配置中的 `imageIncapableModels`，将灰度模型前缀统一为「灰度」。
+fn sync_opencode_image_proxy_incapable_models(
+    config_path: &Path,
+    platform: &GrayscalePlatformModels,
+) -> Result<(), String> {
+    let content = fs::read_to_string(config_path)
+        .map_err(|e| format!("读取图片代理配置失败: {e}"))?;
+    let Ok(mut value) = serde_json::from_str::<Value>(&content) else {
+        return Ok(());
+    };
+
+    let grayscale_model_ids: HashSet<String> = platform
+        .additional_models
+        .iter()
+        .filter(|model| !is_opencode_zwitch_openai_model(model))
+        .map(|model| model.id.clone())
+        .collect();
+    let synced = opencode_image_incapable_models(platform);
+    let existing = value
+        .get("imageIncapableModels")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|entry| {
+                    entry
+                        .split_once('/')
+                        .is_none_or(|(_, model_id)| !grayscale_model_ids.contains(model_id))
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut merged = existing;
+    merged.extend(synced);
+    merged.sort();
+    merged.dedup();
+
+    let current = value
+        .get("imageIncapableModels")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if current == merged {
+        return Ok(());
+    }
+
+    value.as_object_mut().ok_or_else(|| {
+        "图片代理配置根节点必须是对象".to_string()
+    })?;
+    value["imageIncapableModels"] = Value::Array(
+        merged
+            .into_iter()
+            .map(Value::String)
+            .collect(),
+    );
+
+    let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    write_config(config_path, &new_content)
 }
 
 /// 将旧版图片代理配置中的 `imageReaderModel.providerID = "openai"` 迁移到新 Provider key。
@@ -2562,8 +2933,8 @@ mod tests {
         assert_eq!(
             incapable,
             vec![
-                "claude/claude-mythos-preview".to_string(),
-                "claude/claude-mythos-preview-fast".to_string(),
+                "灰度/claude-mythos-preview".to_string(),
+                "灰度/claude-mythos-preview-fast".to_string(),
             ]
         );
     }
@@ -2604,9 +2975,9 @@ mod tests {
         assert!(input_modalities.iter().any(|v| v == "image"));
 
         // 灰度 Provider 仍走 opencode 前缀。
-        let claude = providers.get("claude").unwrap();
+        let grayscale = providers.get("灰度").unwrap();
         assert_eq!(
-            claude
+            grayscale
                 .get("options")
                 .and_then(|options| options.get("baseURL"))
                 .and_then(Value::as_str),
@@ -2640,6 +3011,47 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("The user has pasted an image"));
+    }
+
+    #[test]
+    fn sync_image_proxy_rewrites_legacy_grayscale_prefixes() {
+        let dir = std::env::temp_dir().join(format!("zwitch-opencode-image-proxy-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("opencode-image-proxy.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "imageIncapableModels": [
+    "zai-coding-plan/glm-4.6",
+    "灰度 Mythos/claude-mythos-preview-fast",
+    "claude/claude-mythos-preview"
+  ],
+  "imageReaderModel": { "providerID": "zwitch-openai", "modelID": "gpt-5.4" }
+}"#,
+        )
+        .unwrap();
+
+        let platform = opencode_platform(vec![
+            grayscale_model("claude-mythos-preview-fast", "claude", "灰度 Mythos"),
+            grayscale_model("claude-mythos-preview", "claude", "claude"),
+        ]);
+        sync_opencode_image_proxy_incapable_models(&config_path, &platform).unwrap();
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let models: Vec<&str> = value["imageIncapableModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(models.contains(&"zai-coding-plan/glm-4.6"));
+        assert!(models.contains(&"灰度/claude-mythos-preview-fast"));
+        assert!(models.contains(&"灰度/claude-mythos-preview"));
+        assert!(!models.iter().any(|entry| entry.starts_with("灰度 Mythos/")));
+        assert!(!models.iter().any(|entry| entry.starts_with("claude/")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2927,6 +3339,109 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
+    fn cli_install_detection_matches_tool_definition() {
+        for tool in TOOLS {
+            let installed = is_tool_installed(tool);
+            let via_paths = tool_installed_at_known_paths(tool.id);
+            let via_binary = find_binary(tool.binaries).is_some();
+            assert_eq!(
+                installed,
+                via_paths || via_binary,
+                "{} install detection should combine PATH lookup and known install paths",
+                tool.id
+            );
+        }
+    }
+
+    #[test]
+    fn any_file_in_versioned_subdirs_detects_nested_desktop_cli() {
+        let dir = std::env::temp_dir().join(format!(
+            "zwitch-desktop-cli-detect-{}",
+            std::process::id()
+        ));
+        let version_dir = dir.join("2.1.0");
+        let claude_bin = version_dir
+            .join("claude.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("claude");
+        fs::create_dir_all(claude_bin.parent().unwrap()).unwrap();
+        fs::write(&claude_bin, b"#!/bin/sh\n").unwrap();
+
+        assert!(any_file_in_versioned_subdirs(
+            &dir,
+            &["claude.app", "Contents", "MacOS", "claude"]
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn any_nonempty_file_in_dir_ignores_empty_markers() {
+        let dir = std::env::temp_dir().join(format!(
+            "zwitch-claude-versions-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("2.1.0"), b"").unwrap();
+
+        assert!(!any_nonempty_file_in_dir(&dir));
+
+        fs::write(dir.join("2.1.1"), b"fake-binary").unwrap();
+        assert!(any_nonempty_file_in_dir(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn electron_app_data_installed_checks_xdg_and_data_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "zwitch-electron-app-data-{}",
+            std::process::id()
+        ));
+        let app_id = "ai.opencode.desktop";
+        let app_data = dir.join(".config").join(app_id);
+        fs::create_dir_all(&app_data).unwrap();
+
+        assert!(electron_app_data_installed(&dir, app_id));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_candidate_paths_include_windows_exe_suffix() {
+        let home = PathBuf::from("/tmp/home");
+        let paths = cli_candidate_paths(&home, "claude");
+        assert!(paths.iter().any(|path| path.ends_with("claude")));
+        #[cfg(windows)]
+        assert!(paths.iter().any(|path| path.ends_with("claude.exe")));
+    }
+
+    #[test]
+    fn windows_claude_msix_installed_detects_package_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "zwitch-claude-msix-{}",
+            std::process::id()
+        ));
+        let packages = dir.join("Packages");
+        fs::create_dir_all(packages.join("Claude_pzs8sxrjxfjjc")).unwrap();
+
+        #[cfg(windows)]
+        {
+            std::env::set_var("LOCALAPPDATA", &dir);
+            assert!(windows_claude_msix_installed());
+            std::env::remove_var("LOCALAPPDATA");
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(!windows_claude_msix_installed());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn claude_prioritizes_default_grayscale_model() {
         let mut value = serde_json::json!({ "env": {} });
         inject_claude_grayscale_models(
@@ -2992,7 +3507,7 @@ base_url = "http://old.example/codex"
         ]);
         assert_eq!(
             resolve_opencode_default_model(&platform).as_deref(),
-            Some("claude/claude-mythos-preview-fast")
+            Some("灰度/claude-mythos-preview-fast")
         );
     }
 
@@ -3049,7 +3564,7 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
-    fn opencode_provider_key_uses_key_name_not_provider_id() {
+    fn opencode_provider_key_uses_unified_grayscale_name() {
         let models = vec![GrayscaleModelEntry {
             id: "claude-mythos-preview".into(),
             provider: "测试".into(),
@@ -3061,7 +3576,7 @@ base_url = "http://old.example/codex"
             context_window: None,
             max_tokens: None,
         }];
-        assert_eq!(opencode_provider_key_from_models(&models), "灰度 Mythos");
+        assert_eq!(opencode_provider_key_from_models(&models), "灰度");
     }
 
     #[test]
@@ -3094,18 +3609,18 @@ base_url = "http://old.example/codex"
         let (providers, managed_keys) =
             build_opencode_providers_config("http://127.0.0.1:51805/opencode", &platform);
         let providers = providers.as_object().unwrap();
-        let claude = providers.get("灰度 Claude").unwrap().as_object().unwrap();
+        let grayscale = providers.get("灰度").unwrap().as_object().unwrap();
 
-        assert_eq!(managed_keys, vec!["灰度 Claude"]);
+        assert_eq!(managed_keys, vec!["灰度"]);
         assert_eq!(
-            claude.get("npm").and_then(Value::as_str),
+            grayscale.get("npm").and_then(Value::as_str),
             Some(OPENCODE_OPENAI_RESPONSES_NPM)
         );
         assert_eq!(
-            claude.get("name").and_then(Value::as_str),
-            Some("灰度 Claude")
+            grayscale.get("name").and_then(Value::as_str),
+            Some("灰度")
         );
-        let models = claude.get("models").unwrap().as_object().unwrap();
+        let models = grayscale.get("models").unwrap().as_object().unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(
             models
@@ -3119,7 +3634,7 @@ base_url = "http://old.example/codex"
     }
 
     #[test]
-    fn opencode_appends_grayscale_marker_to_provider_without_existing_marker() {
+    fn opencode_grayscale_provider_display_name_is_unified() {
         let models = vec![GrayscaleModelEntry {
             id: "glm-4.6".into(),
             provider: "zhipu".into(),
@@ -3133,12 +3648,12 @@ base_url = "http://old.example/codex"
         }];
         assert_eq!(
             opencode_grayscale_provider_display_name(&models),
-            "GLM（灰度）"
+            "灰度"
         );
     }
 
     #[test]
-    fn opencode_skips_duplicate_grayscale_marker_on_provider() {
+    fn opencode_grayscale_provider_display_name_ignores_key_name_marker() {
         let models = vec![GrayscaleModelEntry {
             id: "claude-mythos-preview".into(),
             provider: "claude".into(),
@@ -3152,7 +3667,7 @@ base_url = "http://old.example/codex"
         }];
         assert_eq!(
             opencode_grayscale_provider_display_name(&models),
-            "灰度 Mythos"
+            "灰度"
         );
     }
 
@@ -3174,7 +3689,7 @@ base_url = "http://old.example/codex"
         let provider = providers
             .as_object()
             .unwrap()
-            .get("灰度 GLM")
+            .get("灰度")
             .unwrap()
             .as_object()
             .unwrap();
@@ -3236,7 +3751,7 @@ base_url = "http://old.example/codex"
         providers.insert(
             "custom-claude".into(),
             serde_json::json!({
-                "name": "claude",
+                "name": "灰度",
                 "npm": "@ai-sdk/openai",
                 "options": { "baseURL": "https://api.example.com/v1" }
             }),
@@ -3260,9 +3775,9 @@ base_url = "http://old.example/codex"
         merge_opencode_injected_providers(&mut providers, &injected);
 
         assert_eq!(providers.len(), 1);
-        assert!(providers.contains_key("claude"));
+        assert!(providers.contains_key("灰度"));
         assert!(!providers.contains_key("custom-claude"));
-        let provider = providers.get("claude").unwrap();
+        let provider = providers.get("灰度").unwrap();
         assert_eq!(
             provider
                 .get("options")
@@ -3307,7 +3822,7 @@ base_url = "http://old.example/codex"
         let restored_value: Value = serde_json::from_str(&restored).unwrap();
         let providers = restored_value.get("provider").unwrap().as_object().unwrap();
         assert!(providers.contains_key("local"));
-        assert!(!providers.contains_key("灰度 Claude"));
+        assert!(!providers.contains_key("灰度"));
     }
 
     #[test]
