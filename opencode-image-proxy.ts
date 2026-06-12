@@ -1,8 +1,7 @@
 import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import type { Plugin, PluginInput } from "@opencode-ai/plugin"
-import type { Message, Part } from "@opencode-ai/sdk"
+import type { Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
 
 const DEFAULT_IMAGE_INCAPABLE_MODELS = [
   "zai-coding-plan/glm-4.5",
@@ -30,6 +29,18 @@ interface Config {
   imageIncapableModels: string[]
   imageReaderModel: { providerID: string; modelID: string }
   analysisPrompt: string
+}
+
+interface Part {
+  id?: string
+  type: string
+  mime?: string
+  url?: string
+  text?: string
+  filename?: string
+  messageID?: string
+  sessionID?: string
+  [key: string]: unknown
 }
 
 type UserConfig = Partial<{
@@ -106,12 +117,18 @@ function getPendingKey(sessionID: string, messageID: string, partID: string): st
   return `${sessionID}:${messageID}:${partID}`
 }
 
-function isFilePart(part: Part): part is Part & { type: "file"; mime: string; url: string; filename?: string } {
-  return part.type === "file" && typeof (part as Record<string, unknown>).mime === "string" && typeof (part as Record<string, unknown>).url === "string"
+function resolveModel(
+  input: { model?: { providerID: string; modelID: string } },
+  output: { message?: { model?: { providerID: string; modelID: string } } },
+) {
+  return input.model ?? output.message?.model
 }
 
-function isTextPart(part: Part): part is Part & { type: "text"; text: string } {
-  return part.type === "text" && typeof (part as Record<string, unknown>).text === "string"
+function resolveMessageID(
+  input: { messageID?: string },
+  output: { message?: { id?: string } },
+) {
+  return input.messageID ?? output.message?.id
 }
 
 async function analyzeImageViaOpencode(imageDataUrl: string, filename?: string, mime?: string): Promise<string> {
@@ -153,12 +170,12 @@ async function analyzeImageViaOpencode(imageDataUrl: string, filename?: string, 
         return "[Image analysis failed: no response from vision model]"
       }
 
-      const textParts = (response.data.parts ?? []).filter(isTextPart)
+      const textParts = (response.data.parts ?? []).filter((p: Part) => p.type === "text" && p.text)
       if (textParts.length === 0) {
         return "[Image analysis failed: no text in response]"
       }
 
-      return textParts.map((p) => p.text).join("\n")
+      return textParts.map((p: Part) => p.text).join("\n")
     } finally {
       await client.session.delete({ path: { id: sessionID } }).catch(() => {})
     }
@@ -169,14 +186,10 @@ async function analyzeImageViaOpencode(imageDataUrl: string, filename?: string, 
 }
 
 async function updatePartInDB(part: Part): Promise<void> {
-  if (!pluginContext) return
-  const partId = (part as Record<string, unknown>).id as string | undefined
-  const messageId = (part as Record<string, unknown>).messageID as string | undefined
-  const sessionId = (part as Record<string, unknown>).sessionID as string | undefined
-  if (!partId || !messageId || !sessionId) return
+  if (!pluginContext || !part.id || !part.messageID || !part.sessionID) return
 
   const { serverUrl } = pluginContext
-  const url = new URL(`/session/${sessionId}/message/${messageId}/part/${partId}`, serverUrl)
+  const url = new URL(`/session/${part.sessionID}/message/${part.messageID}/part/${part.id}`, serverUrl)
 
   try {
     await fetch(url, {
@@ -195,29 +208,27 @@ export const OpencodeVisionPlugin: Plugin = async (ctx) => {
 
   return {
     "chat.message": async (input, output) => {
-      if (!input.model || !isImageIncapableModel(input.model.providerID, input.model.modelID)) return
+      const model = resolveModel(input, output)
+      if (!model || !isImageIncapableModel(model.providerID, model.modelID)) return
       if (!output.parts?.length) return
 
-      const messageID = input.messageID
+      const messageID = resolveMessageID(input, output)
       if (!messageID) return
 
-      for (let i = 0; i < output.parts.length; i++) {
-        const part = output.parts[i]
-        if (isFilePart(part) && part.mime?.startsWith("image/") && part.url) {
-          const partId = (part as Record<string, unknown>).id as string | undefined
-          if (!partId) continue
-          const key = getPendingKey(input.sessionID, messageID, partId)
+      for (const part of output.parts) {
+        if (part.type === "file" && part.mime?.startsWith("image/") && part.url && part.id) {
+          const key = getPendingKey(input.sessionID, messageID, part.id)
           const promise = analyzeImageViaOpencode(part.url, part.filename, part.mime).then(async (analysis) => {
             const displayName = part.filename ?? `image.${part.mime?.split("/")[1] ?? "bin"}`
-            const updatedPart = {
+            const updatedPart: Part = {
               ...part,
-              type: "text" as const,
+              type: "text",
               text: `${IMAGE_WRAPPER_PREFIX}${displayName}${IMAGE_WRAPPER_SUFFIX}\n${analysis}`,
             }
-            delete (updatedPart as Record<string, unknown>).url
-            delete (updatedPart as Record<string, unknown>).mime
-            await updatePartInDB(updatedPart as Part)
-            return { updatedPart: updatedPart as Part }
+            delete updatedPart.url
+            delete updatedPart.mime
+            await updatePartInDB(updatedPart)
+            return { updatedPart }
           })
           pendingAnalyses.set(key, promise)
         }
@@ -234,19 +245,12 @@ export const OpencodeVisionPlugin: Plugin = async (ctx) => {
         if (!sessionID || !messageID) continue
 
         for (let i = 0; i < msg.parts.length; i++) {
-          const part = msg.parts[i]
-          if (isFilePart(part) && part.mime?.startsWith("image/")) {
-            const partId = (part as Record<string, unknown>).id as string | undefined
-            if (!partId) continue
-            const key = getPendingKey(sessionID, messageID, partId)
-            const pending = pendingAnalyses.get(key)
+          const part = msg.parts[i] as Part
+          if (part.type === "file" && part.mime?.startsWith("image/") && part.id) {
+            const pending = pendingAnalyses.get(getPendingKey(sessionID, messageID, part.id))
             if (pending) {
-              try {
-                const { updatedPart } = await pending
-                msg.parts[i] = updatedPart
-              } finally {
-                pendingAnalyses.delete(key)
-              }
+              const { updatedPart } = await pending
+              msg.parts[i] = updatedPart as typeof part
             }
           }
         }
@@ -255,4 +259,9 @@ export const OpencodeVisionPlugin: Plugin = async (ctx) => {
   }
 }
 
-export default OpencodeVisionPlugin
+const pluginModule: PluginModule = {
+  id: "opencode-image-proxy",
+  server: OpencodeVisionPlugin,
+}
+
+export default pluginModule
