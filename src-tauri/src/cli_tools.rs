@@ -136,6 +136,13 @@ const OPENCODE_OPENAI_RESPONSES_NPM: &str = "@ai-sdk/openai";
 const OPENCODE_DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 /// OpenCode schema 要求 `limit.output` 与 `limit.context` 同时存在时的默认最大输出（tokens）。
 const OPENCODE_DEFAULT_MAX_OUTPUT: u64 = 65_536;
+/// 已知灰度模型的上下文/输出上限兜底表：`(model_id, context, output)`。
+/// 后端 grayscale-models 接口当前不返回 `context_window` / `max_tokens`，
+/// 客户端按此表为已知模型写入正确数值，避免回退到泛化默认值后在 OpenCode 上「不生效」。
+const OPENCODE_GRAYSCALE_MODEL_LIMITS: &[(&str, u64, u64)] = &[
+    ("claude-mythos-preview", 1_000_000, 64_000),
+    ("claude-mythos-preview-fast", 1_000_000, 64_000),
+];
 /// OpenCode 图片代理插件落盘位置（OpenCode 全局插件目录）。
 const OPENCODE_IMAGE_PROXY_PLUGIN_RELATIVE: &str =
     ".config/opencode/plugins/opencode-image-proxy.ts";
@@ -1460,18 +1467,29 @@ fn build_opencode_model_entry(model: &GrayscaleModelEntry) -> Value {
     );
 
     let mut limit = serde_json::Map::new();
+    let override_limits = opencode_grayscale_model_limit_override(&model.id);
     let context_window = model
         .context_window
         .filter(|value| *value > 0)
+        .or_else(|| override_limits.map(|(context, _)| context))
         .unwrap_or(OPENCODE_DEFAULT_CONTEXT_WINDOW);
     let max_output = model
         .max_tokens
         .filter(|value| *value > 0)
+        .or_else(|| override_limits.map(|(_, output)| output))
         .unwrap_or(OPENCODE_DEFAULT_MAX_OUTPUT);
     limit.insert("context".to_string(), Value::Number(context_window.into()));
     limit.insert("output".to_string(), Value::Number(max_output.into()));
     entry.insert("limit".to_string(), Value::Object(limit));
     Value::Object(entry)
+}
+
+/// 查询已知灰度模型的上下文/输出兜底上限，返回 `(context, output)`。
+fn opencode_grayscale_model_limit_override(model_id: &str) -> Option<(u64, u64)> {
+    OPENCODE_GRAYSCALE_MODEL_LIMITS
+        .iter()
+        .find(|(id, _, _)| *id == model_id)
+        .map(|(_, context, output)| (*context, *output))
 }
 
 fn build_opencode_provider_base_url(local_proxy_base: &str, base_path: &str) -> String {
@@ -3724,7 +3742,7 @@ base_url = "http://old.example/codex"
     #[test]
     fn opencode_model_entry_defaults_context_when_api_missing() {
         let entry = build_opencode_model_entry(&GrayscaleModelEntry {
-            id: "claude-mythos-preview".into(),
+            id: "some-unknown-grayscale-model".into(),
             provider: "claude".into(),
             key_id: String::new(),
             key_name: String::new(),
@@ -3743,6 +3761,52 @@ base_url = "http://old.example/codex"
             limit.get("output").and_then(Value::as_u64),
             Some(OPENCODE_DEFAULT_MAX_OUTPUT)
         );
+    }
+
+    #[test]
+    fn opencode_model_entry_uses_client_override_when_api_missing() {
+        for model_id in ["claude-mythos-preview", "claude-mythos-preview-fast"] {
+            let entry = build_opencode_model_entry(&GrayscaleModelEntry {
+                id: model_id.into(),
+                provider: "claude".into(),
+                key_id: String::new(),
+                key_name: String::new(),
+                source: "grayscale".into(),
+                api: None,
+                base_path: None,
+                context_window: None,
+                max_tokens: None,
+            });
+            let limit = entry.get("limit").unwrap().as_object().unwrap();
+            assert_eq!(
+                limit.get("context").and_then(Value::as_u64),
+                Some(1_000_000),
+                "{model_id} context"
+            );
+            assert_eq!(
+                limit.get("output").and_then(Value::as_u64),
+                Some(64_000),
+                "{model_id} output"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_model_entry_prefers_api_limits_over_client_override() {
+        let entry = build_opencode_model_entry(&GrayscaleModelEntry {
+            id: "claude-mythos-preview".into(),
+            provider: "claude".into(),
+            key_id: String::new(),
+            key_name: String::new(),
+            source: "grayscale".into(),
+            api: None,
+            base_path: None,
+            context_window: Some(200_000),
+            max_tokens: Some(32_000),
+        });
+        let limit = entry.get("limit").unwrap().as_object().unwrap();
+        assert_eq!(limit.get("context").and_then(Value::as_u64), Some(200_000));
+        assert_eq!(limit.get("output").and_then(Value::as_u64), Some(32_000));
     }
 
     #[test]
