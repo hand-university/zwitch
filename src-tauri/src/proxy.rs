@@ -273,18 +273,6 @@ fn build_upstream_url(tool_id: &str, gateway: &str, rest: &str) -> String {
                 format!("{gateway}/genai/{rest}")
             }
         }
-        "opencode" => {
-            if rest.starts_with("openai/")
-                || rest.starts_with("anthropic/")
-                || rest.starts_with("genai/")
-            {
-                format!("{gateway}/{rest}")
-            } else if rest.starts_with("v1/") {
-                format!("{gateway}/openai/{rest}")
-            } else {
-                format!("{gateway}/{rest}")
-            }
-        }
         _ => {
             if rest.starts_with("v1/") {
                 format!("{gateway}/{rest}")
@@ -421,9 +409,7 @@ fn merge_grayscale_models_into_list(
     additional: &[crate::grayscale_api::GrayscaleModelEntry],
 ) -> Result<String, String> {
     match tool_id {
-        "codex" | "opencode" => {
-            crate::grayscale_api::append_openai_models_list(upstream_body, additional)
-        }
+        "codex" => crate::grayscale_api::append_openai_models_list(upstream_body, additional),
         "claude" => crate::grayscale_api::append_anthropic_models_list(upstream_body, additional),
         _ => Ok(upstream_body.to_string()),
     }
@@ -515,11 +501,7 @@ async fn forward_request(
         model: usage::extract_model(provider, path, body_bytes),
     });
 
-    // OpenCode 走自定义 OpenAI 兼容路由，上游对灰度模型不回报 output_tokens；
-    // 代理在转发时按响应文本估算补写，避免 OpenCode 上下文面板显示 0。
-    let rewrite_usage = tool_id == "opencode";
-
-    build_upstream_response(upstream_resp, usage_ctx, rewrite_usage)
+    build_upstream_response(upstream_resp, usage_ctx, false)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }

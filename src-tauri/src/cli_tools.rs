@@ -1,9 +1,7 @@
 use crate::config::LOCAL_PROXY_HOST;
 use crate::grayscale_api::{
-    fetch_grayscale_models, find_platform_models, grayscale_model_display_name,
-    merge_opencode_platform_response, prioritize_grayscale_default_model,
-    resolve_opencode_grayscale_platform, GrayscaleModelEntry, GrayscalePlatformModels,
-    GRAYSCALE_DEFAULT_MODEL_ID,
+    fetch_grayscale_models, find_platform_models, prioritize_grayscale_default_model,
+    GrayscaleModelEntry, GrayscalePlatformModels,
 };
 use crate::store::StoredSettings;
 use crate::store::{load_auth, load_backup, load_settings, save_backup};
@@ -31,7 +29,7 @@ pub struct CliToolStatus {
     pub quick_start_doc_url: String,
     /// 用户是否允许为该工具注入配置（默认开启）。
     pub config_enabled: bool,
-    /// 当前用户是否有灰度模型权限（仅 OpenCode 使用）。
+    /// 当前用户是否有灰度模型权限（Claude Code 使用）。
     #[serde(default)]
     pub has_grayscale: bool,
     pub config_path: String,
@@ -49,20 +47,27 @@ enum ConfigFormat {
 
 /// 旧版注入使用的自定义 provider，还原时需清理。
 const LEGACY_CODEX_MODEL_PROVIDER: &str = "zsdx_ai";
+const CODEX_MODEL_PROVIDER: &str = "zwitch";
 const CODEX_OPENAI_BASE_URL_KEY: &str = "openai_base_url";
+const CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY: &str = "base_url";
+const CODEX_AUTH_RELATIVE: &str = ".codex/auth.json";
+const CODEX_PROXY_API_KEY_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 const CODEX_CONFIG_FIELDS: &[&str] = &[
     "snapshot",
     "openai_base_url",
+    "base_url",
+    "wire_api",
     "model",
     "model_provider",
     "model_field_order",
     "model_catalog_json",
-    "model_providers.zsdx_ai",
+    "model_providers.zwitch",
 ];
 
 const CLAUDE_CUSTOM_MODEL_ENV_PREFIX: &str = "ANTHROPIC_CUSTOM_MODEL_OPTION";
 const CLAUDE_GATEWAY_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
+const CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_ENV: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
 const ZWITCH_MANAGED_MODEL_CATALOG_MARKER: &str = "zwitch-grayscale-catalog.json";
 const CODEX_GRAYSCALE_CATALOG_RELATIVE: &str = ".codex/zwitch-grayscale-catalog.json";
 
@@ -126,43 +131,6 @@ const OPENCODE_TARGETS: &[ConfigTarget] = &[ConfigTarget {
 }];
 
 const OPENCODE_MANAGED_PROVIDERS_BACKUP_KEY: &str = "managed_providers";
-/// OpenCode 自定义 Provider 需要 apiKey 字段；实际鉴权由本地代理注入，此处仅占位。
-const OPENCODE_PROXY_API_KEY_PLACEHOLDER: &str = "zwitch";
-/// OpenAI 兼容 Provider 使用的 AI SDK 适配器（`/v1/chat/completions`）。
-const OPENCODE_OPENAI_COMPATIBLE_NPM: &str = "@ai-sdk/openai-compatible";
-/// 使用 `/v1/responses` 的 Provider 改用官方 OpenAI 适配器。
-const OPENCODE_OPENAI_RESPONSES_NPM: &str = "@ai-sdk/openai";
-/// OpenCode 灰度模型未声明 `context_window` 时的默认上下文窗口（tokens）。
-const OPENCODE_DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
-/// OpenCode schema 要求 `limit.output` 与 `limit.context` 同时存在时的默认最大输出（tokens）。
-const OPENCODE_DEFAULT_MAX_OUTPUT: u64 = 65_536;
-/// 已知灰度模型的上下文/输出上限兜底表：`(model_id, context, output)`。
-/// 后端 grayscale-models 接口当前不返回 `context_window` / `max_tokens`，
-/// 客户端按此表为已知模型写入正确数值，避免回退到泛化默认值后在 OpenCode 上「不生效」。
-const OPENCODE_GRAYSCALE_MODEL_LIMITS: &[(&str, u64, u64)] = &[
-    ("claude-mythos-preview", 1_000_000, 64_000),
-    ("claude-mythos-preview-fast", 1_000_000, 64_000),
-];
-/// OpenCode 图片代理插件落盘位置（OpenCode 全局插件目录）。
-const OPENCODE_IMAGE_PROXY_PLUGIN_RELATIVE: &str =
-    ".config/opencode/plugins/opencode-image-proxy.ts";
-/// OpenCode 图片代理插件的配置文件（OpenCode 配置目录）。
-const OPENCODE_IMAGE_PROXY_CONFIG_RELATIVE: &str = ".config/opencode/opencode-image-proxy.json";
-/// 图片代理插件源码，编译期内嵌，注入时若缺失则落盘。
-const OPENCODE_IMAGE_PROXY_PLUGIN_SOURCE: &str = include_str!("../../opencode-image-proxy.ts");
-/// 注入 OpenCode 的 OpenAI 自定义 Provider key。
-/// 不能使用 `openai`：会与 OpenCode 内置 Provider 冲突，触发其 OAuth 凭证刷新（401）。
-const OPENCODE_OPENAI_PROVIDER_KEY: &str = "zwitch-openai";
-/// 旧版本注入使用的 Provider key，迁移配置时识别。
-const OPENCODE_OPENAI_LEGACY_PROVIDER_KEY: &str = "openai";
-/// OpenAI 自定义 Provider 暴露的模型列表。
-const OPENCODE_OPENAI_MODEL_IDS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"];
-/// 图片识别服务使用的模型。
-const OPENCODE_IMAGE_READER_MODEL_ID: &str = "gpt-5.4";
-/// 图片代理插件的默认分析提示词。
-const OPENCODE_IMAGE_ANALYSIS_PROMPT: &str = "The user has pasted an image into their chat. Describe what you see as if you are directly observing the image. Be thorough but concise. Include:\n- All visible elements (objects, text, UI elements, people, etc.)\n- Exact transcription of any text\n- The context and purpose of the image\n- Any relevant technical details\n\nDescribe it naturally, as if explaining to someone what you're looking at right now.";
-/// 注入 OpenCode 的灰度 Provider key 与展示名，不随 API Key 名称变化。
-const OPENCODE_GRAYSCALE_PROVIDER_KEY: &str = "灰度";
 
 const TOOLS: &[ToolDefinition] = &[
     ToolDefinition {
@@ -185,29 +153,31 @@ const TOOLS: &[ToolDefinition] = &[
         quick_start_doc_url: "https://code.claude.com/docs/en/quickstart",
         targets: CLAUDE_TARGETS,
     },
+];
+
+/// 暂时禁用的工具：不参与检测/注入，但会尝试还原已注入的配置。
+const DISABLED_TOOLS: &[ToolDefinition] = &[
+    ToolDefinition {
+        id: "gemini",
+        name: "Gemini CLI",
+        binaries: &["gemini"],
+        base_url_field: "GOOGLE_GEMINI_BASE_URL",
+        token_field: "GEMINI_API_KEY",
+        install_shell: "npm install -g @google/gemini-cli",
+        quick_start_doc_url: "https://github.com/google-gemini/gemini-cli",
+        targets: GEMINI_TARGETS,
+    },
     ToolDefinition {
         id: "opencode",
         name: "OpenCode",
         binaries: &["opencode"],
         base_url_field: "provider.*.options.baseURL",
         token_field: "provider.*.options.apiKey",
-        install_shell: "curl -fsSL https://opencode.ai/install | bash",
-        quick_start_doc_url: "https://opencode.ai/docs/",
+        install_shell: "",
+        quick_start_doc_url: "",
         targets: OPENCODE_TARGETS,
     },
 ];
-
-/// 暂时禁用的工具：不参与检测/注入，但会尝试还原已注入的配置。
-const DISABLED_TOOLS: &[ToolDefinition] = &[ToolDefinition {
-    id: "gemini",
-    name: "Gemini CLI",
-    binaries: &["gemini"],
-    base_url_field: "GOOGLE_GEMINI_BASE_URL",
-    token_field: "GEMINI_API_KEY",
-    install_shell: "npm install -g @google/gemini-cli",
-    quick_start_doc_url: "https://github.com/google-gemini/gemini-cli",
-    targets: GEMINI_TARGETS,
-}];
 
 /// 暴露所有受支持工具的 id，供本地拦截服务建立上游路由映射。
 pub fn tool_ids() -> Vec<&'static str> {
@@ -233,7 +203,6 @@ fn tool_installed_at_known_paths(tool_id: &str) -> bool {
     match tool_id {
         "claude" => claude_installed_at_known_paths(),
         "codex" => codex_installed_at_known_paths(),
-        "opencode" => opencode_installed_at_known_paths(),
         _ => false,
     }
 }
@@ -500,83 +469,6 @@ fn codex_installed_at_known_paths() -> bool {
     false
 }
 
-/// OpenCode 官方安装脚本默认落在 `~/.opencode/bin`，GUI 进程 PATH 常不含该目录。
-fn opencode_installed_at_known_paths() -> bool {
-    let Some(home) = dirs::home_dir() else {
-        return false;
-    };
-
-    let mut cli_paths = cli_candidate_paths(&home, "opencode");
-    cli_paths.extend([
-        home.join(".opencode/bin/opencode"),
-        home.join("go/bin/opencode"),
-    ]);
-    if any_existing_file(&cli_paths) {
-        return true;
-    }
-
-    if electron_app_data_installed(&home, "ai.opencode.desktop") {
-        return true;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if path_is_existing_dir(Path::new("/Applications/OpenCode.app")) {
-            return true;
-        }
-        for relative in [
-            "Contents/MacOS/opencode-cli",
-            "Contents/Resources/opencode-cli",
-        ] {
-            let sidecar = Path::new("/Applications/OpenCode.app").join(relative);
-            if path_is_existing_file(&sidecar) {
-                return true;
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        for relative in [
-            "OpenCode/OpenCode.exe",
-            "opencode-desktop/OpenCode.exe",
-            "OpenCode Desktop/OpenCode.exe",
-        ] {
-            if let Some(path) = windows_local_programs(relative) {
-                if path_is_existing_file(&path) {
-                    return true;
-                }
-            }
-            if let Some(path) = windows_program_files(relative) {
-                if path_is_existing_file(&path) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut linux_paths = unix_system_cli_paths("opencode");
-        linux_paths.extend(unix_system_cli_paths("opencode-cli"));
-        linux_paths.extend([
-            PathBuf::from("/opt/OpenCode/@opencode-aidesktop"),
-            PathBuf::from("/opt/opencode/bin/opencode"),
-            PathBuf::from("/opt/opencode/bin/opencode-cli"),
-        ]);
-        if any_existing_file(&linux_paths) {
-            return true;
-        }
-        if path_is_existing_dir(Path::new("/opt/OpenCode"))
-            || path_is_existing_dir(Path::new("/opt/opencode"))
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
 pub async fn set_tool_config_enabled_async(
     app: &AppHandle,
     tool_id: &str,
@@ -599,7 +491,7 @@ pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolSt
     let home = dirs::home_dir().ok_or_else(|| "无法获取用户目录".to_string())?;
     let settings = load_settings(app)?;
 
-    let show_opencode = if load_auth(app)
+    let show_claude_grayscale = if load_auth(app)
         .ok()
         .and_then(|auth| auth.authorization_code)
         .is_some()
@@ -610,21 +502,16 @@ pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolSt
             .map(|(tool_id, platform)| (tool_id.clone(), platform.additional_models.clone()))
             .collect();
         crate::grayscale_api::update_grayscale_cache(grayscale_models);
-        if grayscale_platforms.contains_key("opencode") {
-            true
-        } else {
-            false
-        }
+        grayscale_platforms.contains_key("claude")
     } else {
         false
     };
 
     Ok(TOOLS
         .iter()
-        .filter(|tool| tool.id != "opencode" || show_opencode)
         .map(|tool| {
             let config_path = home.join(tool.targets[0].relative);
-            let is_opencode = tool.id == "opencode";
+            let is_claude = tool.id == "claude";
             CliToolStatus {
                 id: tool.id.to_string(),
                 name: tool.name.to_string(),
@@ -633,7 +520,7 @@ pub async fn get_cli_tools_status_async(app: &AppHandle) -> Result<Vec<CliToolSt
                 install_shell: tool.install_shell.to_string(),
                 quick_start_doc_url: tool.quick_start_doc_url.to_string(),
                 config_enabled: is_tool_config_enabled(&settings, tool.id),
-                has_grayscale: is_opencode && show_opencode,
+                has_grayscale: is_claude && show_claude_grayscale,
                 config_path: config_path.to_string_lossy().to_string(),
                 base_url_field: tool.base_url_field.to_string(),
                 token_field: tool.token_field.to_string(),
@@ -693,52 +580,6 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
         for target in tool.targets {
             let config_path = home.join(target.relative);
 
-            if tool.id == "opencode" {
-                let platform = grayscale_platforms.get(tool.id);
-                if !tool_enabled
-                    || platform.is_none_or(|platform| platform.additional_models.is_empty())
-                {
-                    if restore_config(app, &mut backup, tool, target, &config_path)? {
-                        backup_dirty = true;
-                    }
-                    continue;
-                }
-
-                if proxy_port == 0 {
-                    eprintln!("OpenCode: 本地代理未启动，跳过 opencode.json 注入");
-                    continue;
-                }
-
-                let already_injected = read_config_if_exists(&config_path)
-                    .map(|content| is_target_injected(tool, target, &content))
-                    .unwrap_or(false);
-
-                if !already_injected {
-                    backup_current_values(&mut backup, tool, target, &config_path)?;
-                    backup_dirty = true;
-                }
-
-                let local_base = if proxy_port != 0 {
-                    crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
-                } else {
-                    crate::proxy::local_proxy_base(tool.id)
-                };
-                let platform = extend_opencode_platform_with_openai_models(
-                    platform.expect("opencode platform checked above"),
-                );
-                inject_opencode_grayscale_models(
-                    tool,
-                    target,
-                    &config_path,
-                    &local_base,
-                    &platform,
-                )?;
-                if let Err(error) = ensure_opencode_image_proxy_assets(&home, &platform) {
-                    eprintln!("OpenCode: 安装图片代理插件失败: {error}");
-                }
-                continue;
-            }
-
             let local_base = if proxy_port != 0 {
                 crate::proxy::local_proxy_base_for_port(tool.id, proxy_port)
             } else {
@@ -748,6 +589,12 @@ pub async fn apply_config_injection_async(app: &AppHandle) -> Result<(), String>
             if !tool_enabled {
                 if restore_config(app, &mut backup, tool, target, &config_path)? {
                     backup_dirty = true;
+                }
+                if tool.id == "codex" {
+                    let auth_path = home.join(CODEX_AUTH_RELATIVE);
+                    if restore_codex_auth(app, &mut backup, &auth_path)? {
+                        backup_dirty = true;
+                    }
                 }
                 continue;
             }
@@ -840,7 +687,6 @@ fn collect_executable_search_dirs() -> Vec<PathBuf> {
 
     if let Some(home) = dirs::home_dir() {
         for suffix in [
-            ".opencode/bin",
             ".local/bin",
             ".cargo/bin",
             ".bun/bin",
@@ -1079,7 +925,7 @@ fn backup_current_values(
                 entry.insert(backup_field_key, stored);
             }
             if tool.id == "claude" {
-                backup_claude_grayscale_env(entry, tool.id, &value);
+                backup_claude_managed_env(entry, tool.id, &value);
             }
         }
         ConfigFormat::Toml => {
@@ -1125,6 +971,134 @@ fn is_local_proxy_base_url(url: &str, tool_id: &str) -> bool {
     url.starts_with(&prefix) && url.ends_with(&format!("/{tool_id}"))
 }
 
+/// Codex 桌面端有时会把 provider 字段展平到顶层 `base_url`（如 `http://127.0.0.1:PORT/v1`）。
+fn is_zwitch_managed_codex_top_level_base_url(url: &str) -> bool {
+    is_local_proxy_base_url(url, "codex") || parse_codex_legacy_local_proxy_port(url).is_some()
+}
+
+fn parse_codex_legacy_local_proxy_port(url: &str) -> Option<u16> {
+    let prefix = format!("http://{LOCAL_PROXY_HOST}:");
+    let rest = url.strip_prefix(&prefix)?;
+    let (port_str, path) = rest.split_once('/')?;
+    let port = port_str.parse().ok()?;
+    if path.is_empty() || path == "v1" || path.starts_with("codex") {
+        Some(port)
+    } else {
+        None
+    }
+}
+
+fn read_codex_injected_proxy_port(content: &str) -> Option<u16> {
+    read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
+        .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+        .or_else(|| {
+            read_top_level_toml_value(content, CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY)
+                .filter(|url| is_local_proxy_base_url(url, "codex"))
+                .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+        })
+        .or_else(|| {
+            extract_toml_section(content, legacy_codex_provider_table_header())
+                .and_then(|body| read_toml_assignment(&body, "base_url"))
+                .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
+        })
+}
+
+fn codex_auth_injected(path: &Path) -> bool {
+    read_config_if_exists(path)
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("OPENAI_API_KEY")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|key| key == CODEX_PROXY_API_KEY_PLACEHOLDER)
+}
+
+fn backup_codex_auth(
+    backup: &mut crate::store::ConfigBackup,
+    config_path: &Path,
+) -> Result<(), String> {
+    let file_key = config_path.to_string_lossy().to_string();
+    let entry = backup.files.entry(file_key).or_default();
+    let backup_field_key = backup_key("codex", "auth.json::OPENAI_API_KEY");
+    if entry.contains_key(&backup_field_key) {
+        return Ok(());
+    }
+
+    let stored = if config_path.exists() {
+        let content = fs::read_to_string(config_path)
+            .map_err(|e| format!("读取配置失败 {}: {e}", config_path.display()))?;
+        serde_json::from_str::<Value>(&content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("OPENAI_API_KEY")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| BACKUP_ABSENT.to_string())
+    } else {
+        BACKUP_ABSENT.to_string()
+    };
+    entry.insert(backup_field_key, stored);
+    Ok(())
+}
+
+fn inject_codex_auth(config_path: &Path) -> Result<(), String> {
+    ensure_parent(config_path)?;
+    let value = serde_json::json!({
+        "OPENAI_API_KEY": CODEX_PROXY_API_KEY_PLACEHOLDER,
+    });
+    write_config(
+        config_path,
+        &serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
+    )
+}
+
+fn restore_codex_auth(
+    app: &AppHandle,
+    backup: &mut crate::store::ConfigBackup,
+    config_path: &Path,
+) -> Result<bool, String> {
+    let file_key = config_path.to_string_lossy().to_string();
+    let Some(file_backup) = backup.files.get(&file_key) else {
+        return Ok(false);
+    };
+    let Some(original) = file_backup.get(&backup_key("codex", "auth.json::OPENAI_API_KEY")) else {
+        return Ok(false);
+    };
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let mut value: Value = serde_json::from_str(
+        &fs::read_to_string(config_path).map_err(|e| format!("读取配置失败: {e}"))?,
+    )
+    .map_err(|e| format!("解析 JSON 失败: {e}"))?;
+
+    if original == BACKUP_ABSENT {
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("OPENAI_API_KEY");
+        }
+        if value.as_object().is_some_and(|obj| obj.is_empty()) {
+            fs::remove_file(config_path).map_err(|e| format!("删除配置失败: {e}"))?;
+            backup.files.remove(&file_key);
+            save_backup(app, backup)?;
+            return Ok(true);
+        }
+    } else {
+        write_json_field(&mut value, "OPENAI_API_KEY", original);
+    }
+
+    write_config(
+        config_path,
+        &serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
+    )?;
+    save_backup(app, backup)?;
+    Ok(true)
+}
+
 fn is_target_injected(tool: &ToolDefinition, target: &ConfigTarget, content: &str) -> bool {
     match target.format {
         ConfigFormat::CodexProviderToml => is_zwitch_injected(content),
@@ -1160,13 +1134,7 @@ fn read_injected_proxy_port(
     }
 
     match target.format {
-        ConfigFormat::CodexProviderToml => read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
-            .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
-            .or_else(|| {
-                extract_toml_section(content, legacy_codex_provider_table_header())
-                    .and_then(|body| read_toml_assignment(&body, "base_url"))
-                    .and_then(|url| crate::proxy::parse_local_proxy_port(&url))
-            }),
+        ConfigFormat::CodexProviderToml => read_codex_injected_proxy_port(content),
         ConfigFormat::Json => serde_json::from_str::<Value>(content)
             .ok()
             .and_then(|value| {
@@ -1308,7 +1276,7 @@ fn restore_config(
 }
 
 fn inject_values(
-    _tool: &ToolDefinition,
+    tool: &ToolDefinition,
     target: &ConfigTarget,
     config_path: &Path,
     base_url: &str,
@@ -1337,6 +1305,10 @@ fn inject_values(
                 serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {e}"))?
             };
 
+            if tool.id == "claude" {
+                strip_injected_claude_env(&mut value);
+            }
+
             for field in target.fields {
                 write_json_field(
                     &mut value,
@@ -1345,7 +1317,10 @@ fn inject_values(
                 );
             }
 
-            inject_claude_grayscale_models(&mut value, additional_models);
+            if tool.id == "claude" {
+                inject_claude_grayscale_models(&mut value, additional_models);
+            }
+
             serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
         }
         ConfigFormat::Toml => {
@@ -1373,140 +1348,6 @@ fn inject_values(
     write_config(config_path, &new_content)
 }
 
-fn normalize_opencode_base_path(base_path: &str) -> String {
-    let trimmed = base_path.trim();
-    if trimmed.is_empty() {
-        return "/openai".to_string();
-    }
-    if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{trimmed}")
-    }
-}
-
-fn default_opencode_base_path_for_provider(provider: &str) -> String {
-    match provider {
-        "gemini" | "google" | "google-generative-ai" => "/genai".to_string(),
-        "anthropic" => "/anthropic".to_string(),
-        _ => "/openai".to_string(),
-    }
-}
-
-fn infer_opencode_api_from_base_path(base_path: &str) -> &'static str {
-    match normalize_opencode_base_path(base_path).as_str() {
-        "/anthropic" => "anthropic-messages",
-        "/genai" => "google-generative-ai",
-        _ => "openai-responses",
-    }
-}
-
-/// 根据灰度模型声明的 API 类型选择 OpenCode 使用的 AI SDK 适配器。
-fn opencode_npm_for_api(api: &str) -> &'static str {
-    match api {
-        "openai-responses" => OPENCODE_OPENAI_RESPONSES_NPM,
-        _ => OPENCODE_OPENAI_COMPATIBLE_NPM,
-    }
-}
-
-fn resolve_opencode_provider_base_path(
-    provider: &str,
-    models: &[GrayscaleModelEntry],
-    platform: &GrayscalePlatformModels,
-) -> String {
-    models
-        .iter()
-        .find_map(|model| model.base_path.clone())
-        .or_else(|| {
-            if platform.base_path.is_empty() {
-                None
-            } else {
-                Some(platform.base_path.clone())
-            }
-        })
-        .map(|path| normalize_opencode_base_path(&path))
-        .unwrap_or_else(|| default_opencode_base_path_for_provider(provider))
-}
-
-fn resolve_opencode_provider_api(base_path: &str, models: &[GrayscaleModelEntry]) -> String {
-    models
-        .iter()
-        .find_map(|model| model.api.clone())
-        .unwrap_or_else(|| infer_opencode_api_from_base_path(base_path).to_string())
-}
-
-fn name_has_grayscale_marker(name: &str) -> bool {
-    name.contains("灰度")
-}
-
-fn is_opencode_zwitch_openai_model(model: &GrayscaleModelEntry) -> bool {
-    model.key_name == OPENCODE_OPENAI_PROVIDER_KEY || model.source == "zwitch-openai"
-}
-
-/// OpenCode 灰度 Provider 统一展示为「灰度」。
-fn opencode_grayscale_provider_display_name(_models: &[GrayscaleModelEntry]) -> String {
-    OPENCODE_GRAYSCALE_PROVIDER_KEY.to_string()
-}
-
-/// 为 OpenCode 模型展示名追加灰度标识。
-fn opencode_grayscale_model_display_name(model: &GrayscaleModelEntry) -> String {
-    let base = grayscale_model_display_name(&model.id);
-    if model.source == "grayscale" && !name_has_grayscale_marker(&base) {
-        format!("{base}（灰度）")
-    } else {
-        base
-    }
-}
-
-/// 构造 OpenCode `provider.<key>.models.<id>` 的取值。
-fn build_opencode_model_entry(model: &GrayscaleModelEntry) -> Value {
-    let mut entry = serde_json::Map::new();
-    entry.insert(
-        "name".to_string(),
-        Value::String(opencode_grayscale_model_display_name(model)),
-    );
-
-    let mut limit = serde_json::Map::new();
-    let override_limits = opencode_grayscale_model_limit_override(&model.id);
-    let context_window = model
-        .context_window
-        .filter(|value| *value > 0)
-        .or_else(|| override_limits.map(|(context, _)| context))
-        .unwrap_or(OPENCODE_DEFAULT_CONTEXT_WINDOW);
-    let max_output = model
-        .max_tokens
-        .filter(|value| *value > 0)
-        .or_else(|| override_limits.map(|(_, output)| output))
-        .unwrap_or(OPENCODE_DEFAULT_MAX_OUTPUT);
-    limit.insert("context".to_string(), Value::Number(context_window.into()));
-    limit.insert("output".to_string(), Value::Number(max_output.into()));
-    entry.insert("limit".to_string(), Value::Object(limit));
-    Value::Object(entry)
-}
-
-/// 查询已知灰度模型的上下文/输出兜底上限，返回 `(context, output)`。
-fn opencode_grayscale_model_limit_override(model_id: &str) -> Option<(u64, u64)> {
-    OPENCODE_GRAYSCALE_MODEL_LIMITS
-        .iter()
-        .find(|(id, _, _)| *id == model_id)
-        .map(|(_, context, output)| (*context, *output))
-}
-
-fn build_opencode_provider_base_url(local_proxy_base: &str, base_path: &str) -> String {
-    let local_proxy_base = local_proxy_base.trim_end_matches('/');
-    let base_path = normalize_opencode_base_path(base_path);
-    format!("{local_proxy_base}{base_path}/v1")
-}
-
-/// 由 OpenCode 的本地代理 base 推导 Codex 的本地代理 base（同端口、不同 tool 前缀）。
-fn codex_local_proxy_base_from(opencode_local_base: &str) -> String {
-    let trimmed = opencode_local_base.trim_end_matches('/');
-    match trimmed.rsplit_once('/') {
-        Some((prefix, _)) => format!("{prefix}/codex"),
-        None => trimmed.to_string(),
-    }
-}
-
 fn is_local_proxy_opencode_provider_base_url(url: &str) -> bool {
     let prefix = format!("http://{LOCAL_PROXY_HOST}:");
     let Some(rest) = url.strip_prefix(&prefix) else {
@@ -1518,112 +1359,12 @@ fn is_local_proxy_opencode_provider_base_url(url: &str) -> bool {
     path.starts_with("opencode/") || path.starts_with("codex/")
 }
 
-/// 读取 OpenCode provider 节点上的 `options.baseURL`。
 fn opencode_provider_base_url(provider: &Value) -> Option<&str> {
     provider
         .get("options")
         .and_then(Value::as_object)
         .and_then(|options| options.get("baseURL"))
         .and_then(Value::as_str)
-}
-
-fn group_opencode_models_by_key(
-    models: &[GrayscaleModelEntry],
-) -> HashMap<String, Vec<GrayscaleModelEntry>> {
-    let mut grouped: HashMap<String, Vec<GrayscaleModelEntry>> = HashMap::new();
-    for model in models {
-        let group_key = if is_opencode_zwitch_openai_model(model) {
-            OPENCODE_OPENAI_PROVIDER_KEY.to_string()
-        } else {
-            OPENCODE_GRAYSCALE_PROVIDER_KEY.to_string()
-        };
-        grouped.entry(group_key).or_default().push(model.clone());
-    }
-    grouped
-}
-
-fn opencode_provider_key_from_models(models: &[GrayscaleModelEntry]) -> String {
-    if models
-        .iter()
-        .any(is_opencode_zwitch_openai_model)
-    {
-        OPENCODE_OPENAI_PROVIDER_KEY.to_string()
-    } else {
-        OPENCODE_GRAYSCALE_PROVIDER_KEY.to_string()
-    }
-}
-
-fn bifrost_provider_for_opencode_models(models: &[GrayscaleModelEntry]) -> String {
-    models
-        .first()
-        .map(|model| model.provider.as_str())
-        .filter(|provider| !provider.is_empty())
-        .unwrap_or("openai")
-        .to_string()
-}
-
-fn build_opencode_providers_config(
-    local_proxy_base: &str,
-    platform: &GrayscalePlatformModels,
-) -> (Value, Vec<String>) {
-    let mut providers = serde_json::Map::new();
-    let mut managed_keys = Vec::new();
-
-    for (_, models) in group_opencode_models_by_key(&platform.additional_models) {
-        let provider_key = opencode_provider_key_from_models(&models);
-        let bifrost_provider = bifrost_provider_for_opencode_models(&models);
-        let base_path = resolve_opencode_provider_base_path(&bifrost_provider, &models, platform);
-        let api = resolve_opencode_provider_api(&base_path, &models);
-        let npm = opencode_npm_for_api(&api);
-        // OpenAI 自定义 Provider 走 Codex 的本地代理前缀，由代理按 Codex 路由转发到 openai/v1。
-        let base_url = if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
-            format!("{}/v1", codex_local_proxy_base_from(local_proxy_base))
-        } else {
-            build_opencode_provider_base_url(local_proxy_base, &base_path)
-        };
-
-        let mut model_entries = serde_json::Map::new();
-        for model in &models {
-            let mut entry = build_opencode_model_entry(model);
-            // 自定义 Provider 默认无视觉能力，OpenCode 会在客户端剥离图片；
-            // OpenAI 模型需显式声明 attachment 与 modalities 才能收到粘贴的图片。
-            if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
-                if let Some(map) = entry.as_object_mut() {
-                    map.insert("attachment".to_string(), Value::Bool(true));
-                    map.insert(
-                        "modalities".to_string(),
-                        serde_json::json!({
-                            "input": ["text", "image"],
-                            "output": ["text"],
-                        }),
-                    );
-                }
-            }
-            model_entries.insert(model.id.clone(), entry);
-        }
-
-        let provider_display_name = if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
-            "ZWitch OpenAI".to_string()
-        } else {
-            opencode_grayscale_provider_display_name(&models)
-        };
-
-        providers.insert(
-            provider_key.clone(),
-            serde_json::json!({
-                "npm": npm,
-                "name": provider_display_name,
-                "options": {
-                    "baseURL": base_url,
-                    "apiKey": OPENCODE_PROXY_API_KEY_PLACEHOLDER,
-                },
-                "models": Value::Object(model_entries),
-            }),
-        );
-        managed_keys.push(provider_key);
-    }
-
-    (Value::Object(providers), managed_keys)
 }
 
 fn opencode_managed_provider_keys_from_providers(
@@ -1637,78 +1378,6 @@ fn opencode_managed_provider_keys_from_providers(
                 .map(|_| key.clone())
         })
         .collect()
-}
-
-fn opencode_provider_display_name<'a>(provider: &'a Value, key: &'a str) -> &'a str {
-    provider
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-        .unwrap_or(key)
-}
-
-fn opencode_provider_keys_matching_name(
-    providers: &serde_json::Map<String, Value>,
-    name: &str,
-) -> Vec<String> {
-    providers
-        .iter()
-        .filter_map(|(key, provider)| {
-            if opencode_provider_display_name(provider, key) == name || key == name {
-                Some(key.clone())
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// 将灰度 Provider 合并进 `opencode.json`：移除此前注入项，并按 `name`/key 替换同名 Provider。
-fn merge_opencode_injected_providers(
-    providers: &mut serde_json::Map<String, Value>,
-    injected_providers: &Value,
-) {
-    let Some(injected) = injected_providers.as_object() else {
-        return;
-    };
-
-    let mut keys_to_remove: HashSet<String> =
-        opencode_managed_provider_keys_from_providers(providers)
-            .into_iter()
-            .collect();
-
-    for (key, provider_value) in injected {
-        let injected_name = opencode_provider_display_name(provider_value, key);
-        for existing_key in opencode_provider_keys_matching_name(providers, injected_name) {
-            keys_to_remove.insert(existing_key);
-        }
-        // 展示名可能带「（灰度）」后缀，需额外按 Provider key / key_name 匹配。
-        for existing_key in opencode_provider_keys_matching_name(providers, key) {
-            keys_to_remove.insert(existing_key);
-        }
-    }
-
-    for key in keys_to_remove {
-        providers.remove(&key);
-    }
-
-    for (key, provider_value) in injected {
-        providers.insert(key.clone(), provider_value.clone());
-    }
-}
-
-fn resolve_opencode_default_model(platform: &GrayscalePlatformModels) -> Option<String> {
-    for (_, models) in group_opencode_models_by_key(&platform.additional_models) {
-        if !models
-            .iter()
-            .any(|model| model.id == GRAYSCALE_DEFAULT_MODEL_ID)
-        {
-            continue;
-        }
-        let provider_key = opencode_provider_key_from_models(&models);
-        return Some(format!("{provider_key}/{GRAYSCALE_DEFAULT_MODEL_ID}"));
-    }
-    None
 }
 
 fn opencode_managed_provider_keys_from_value(value: &Value) -> Vec<String> {
@@ -1795,241 +1464,6 @@ fn restore_opencode_providers(
     serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
 }
 
-fn inject_opencode_grayscale_models(
-    _tool: &ToolDefinition,
-    _target: &ConfigTarget,
-    config_path: &Path,
-    local_proxy_base: &str,
-    platform: &GrayscalePlatformModels,
-) -> Result<(), String> {
-    ensure_parent(config_path)?;
-
-    let content = if config_path.exists() {
-        fs::read_to_string(config_path).map_err(|e| format!("读取配置失败: {e}"))?
-    } else {
-        String::new()
-    };
-
-    let mut value: Value = if content.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(&content).map_err(|e| format!("解析 opencode.json 失败: {e}"))?
-    };
-
-    let (injected_providers, _managed_keys) =
-        build_opencode_providers_config(local_proxy_base, platform);
-
-    let root = value
-        .as_object_mut()
-        .ok_or_else(|| "opencode.json 根节点必须是对象".to_string())?;
-
-    if !root.contains_key("provider") {
-        root.insert("provider".to_string(), Value::Object(Default::default()));
-    }
-
-    let providers = root
-        .get_mut("provider")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| "opencode.json provider 必须是对象".to_string())?;
-    merge_opencode_injected_providers(providers, &injected_providers);
-
-    if let Some(model) = resolve_opencode_default_model(platform) {
-        root.insert("model".to_string(), Value::String(model));
-    }
-
-    let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
-    write_config(config_path, &new_content)
-}
-
-fn opencode_openai_model_entry(model_id: &str) -> GrayscaleModelEntry {
-    GrayscaleModelEntry {
-        id: model_id.to_string(),
-        provider: OPENCODE_OPENAI_PROVIDER_KEY.to_string(),
-        key_id: String::new(),
-        key_name: OPENCODE_OPENAI_PROVIDER_KEY.to_string(),
-        source: "zwitch-openai".to_string(),
-        api: Some("openai-responses".to_string()),
-        base_path: Some("/openai".to_string()),
-        context_window: None,
-        max_tokens: None,
-    }
-}
-
-/// 在灰度平台模型之外补充 OpenAI 自定义 Provider 的模型（gpt-5.5 / gpt-5.4 / gpt-5.4-mini）。
-fn extend_opencode_platform_with_openai_models(
-    platform: &GrayscalePlatformModels,
-) -> GrayscalePlatformModels {
-    let mut extended = platform.clone();
-    let existing: HashSet<String> = extended
-        .additional_models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect();
-    for model_id in OPENCODE_OPENAI_MODEL_IDS {
-        if existing.contains(*model_id) {
-            continue;
-        }
-        extended
-            .additional_models
-            .push(opencode_openai_model_entry(model_id));
-    }
-    extended
-}
-
-/// 收集不具备图片识别能力的模型（除 OpenAI Provider 外的注入模型），格式为 `provider/model`。
-fn opencode_image_incapable_models(platform: &GrayscalePlatformModels) -> Vec<String> {
-    let mut models = Vec::new();
-    for (_, group) in group_opencode_models_by_key(&platform.additional_models) {
-        let provider_key = opencode_provider_key_from_models(&group);
-        if provider_key == OPENCODE_OPENAI_PROVIDER_KEY {
-            continue;
-        }
-        for model in &group {
-            models.push(format!("{provider_key}/{}", model.id));
-        }
-    }
-    models.sort();
-    models.dedup();
-    models
-}
-
-fn build_opencode_image_proxy_config(platform: &GrayscalePlatformModels) -> Value {
-    serde_json::json!({
-        "imageIncapableModels": opencode_image_incapable_models(platform),
-        "imageReaderModel": {
-            "providerID": OPENCODE_OPENAI_PROVIDER_KEY,
-            "modelID": OPENCODE_IMAGE_READER_MODEL_ID,
-        },
-        "analysisPrompt": OPENCODE_IMAGE_ANALYSIS_PROMPT,
-    })
-}
-
-/// 确保 OpenCode 图片代理插件及其配置文件存在；缺失时创建，已存在则不覆盖。
-fn ensure_opencode_image_proxy_assets(
-    home: &Path,
-    platform: &GrayscalePlatformModels,
-) -> Result<(), String> {
-    let plugin_path = home.join(OPENCODE_IMAGE_PROXY_PLUGIN_RELATIVE);
-    if !plugin_path.exists() {
-        write_config(&plugin_path, OPENCODE_IMAGE_PROXY_PLUGIN_SOURCE)?;
-        eprintln!("OpenCode: 已安装图片代理插件 {}", plugin_path.display());
-    }
-
-    let config_path = home.join(OPENCODE_IMAGE_PROXY_CONFIG_RELATIVE);
-    if !config_path.exists() {
-        let config = build_opencode_image_proxy_config(platform);
-        let content =
-            serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-        write_config(&config_path, &content)?;
-        eprintln!(
-            "OpenCode: 已生成图片代理插件配置 {}",
-            config_path.display()
-        );
-    } else {
-        migrate_opencode_image_proxy_reader_provider(&config_path)?;
-        sync_opencode_image_proxy_incapable_models(&config_path, platform)?;
-    }
-
-    Ok(())
-}
-
-/// 同步图片代理配置中的 `imageIncapableModels`，将灰度模型前缀统一为「灰度」。
-fn sync_opencode_image_proxy_incapable_models(
-    config_path: &Path,
-    platform: &GrayscalePlatformModels,
-) -> Result<(), String> {
-    let content = fs::read_to_string(config_path)
-        .map_err(|e| format!("读取图片代理配置失败: {e}"))?;
-    let Ok(mut value) = serde_json::from_str::<Value>(&content) else {
-        return Ok(());
-    };
-
-    let grayscale_model_ids: HashSet<String> = platform
-        .additional_models
-        .iter()
-        .filter(|model| !is_opencode_zwitch_openai_model(model))
-        .map(|model| model.id.clone())
-        .collect();
-    let synced = opencode_image_incapable_models(platform);
-    let existing = value
-        .get("imageIncapableModels")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|entry| {
-                    entry
-                        .split_once('/')
-                        .is_none_or(|(_, model_id)| !grayscale_model_ids.contains(model_id))
-                })
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let mut merged = existing;
-    merged.extend(synced);
-    merged.sort();
-    merged.dedup();
-
-    let current = value
-        .get("imageIncapableModels")
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if current == merged {
-        return Ok(());
-    }
-
-    value.as_object_mut().ok_or_else(|| {
-        "图片代理配置根节点必须是对象".to_string()
-    })?;
-    value["imageIncapableModels"] = Value::Array(
-        merged
-            .into_iter()
-            .map(Value::String)
-            .collect(),
-    );
-
-    let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
-    write_config(config_path, &new_content)
-}
-
-/// 将旧版图片代理配置中的 `imageReaderModel.providerID = "openai"` 迁移到新 Provider key。
-fn migrate_opencode_image_proxy_reader_provider(config_path: &Path) -> Result<(), String> {
-    let content = fs::read_to_string(config_path)
-        .map_err(|e| format!("读取图片代理配置失败: {e}"))?;
-    let Ok(mut value) = serde_json::from_str::<Value>(&content) else {
-        return Ok(());
-    };
-
-    let needs_migration = value
-        .get("imageReaderModel")
-        .and_then(|reader| reader.get("providerID"))
-        .and_then(Value::as_str)
-        .is_some_and(|provider| provider == OPENCODE_OPENAI_LEGACY_PROVIDER_KEY);
-    if !needs_migration {
-        return Ok(());
-    }
-
-    if let Some(provider) = value
-        .get_mut("imageReaderModel")
-        .and_then(|reader| reader.get_mut("providerID"))
-    {
-        *provider = Value::String(OPENCODE_OPENAI_PROVIDER_KEY.to_string());
-    }
-
-    let new_content = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
-    write_config(config_path, &new_content)
-}
-
 async fn resolve_grayscale_api_credential(
     app: &AppHandle,
     auth: &crate::store::StoredAuth,
@@ -2068,7 +1502,7 @@ async fn load_grayscale_platforms_by_tool(
         }
     };
 
-    let mut response = match fetch_grayscale_models(None, &credential, &api_base).await {
+    let response = match fetch_grayscale_models(None, &credential, &api_base).await {
         Ok(response) => response,
         Err(crate::user_api::ApiError::Unauthorized) => {
             eprintln!("拉取灰度模型失败: 凭证无效或已过期，请重新登录");
@@ -2080,29 +1514,8 @@ async fn load_grayscale_platforms_by_tool(
         }
     };
 
-    if let Ok(opencode_only) =
-        fetch_grayscale_models(Some("opencode"), &credential, &api_base).await
-    {
-        response = merge_opencode_platform_response(response, opencode_only);
-    }
-
     let mut by_platform = HashMap::new();
     for tool in TOOLS {
-        if tool.id == "opencode" {
-            if let Some(platform) = resolve_opencode_grayscale_platform(&response) {
-                eprintln!(
-                    "OpenCode: 找到 {} 个灰度模型待注入",
-                    platform.additional_models.len()
-                );
-                by_platform.insert(tool.id.to_string(), platform);
-            } else {
-                eprintln!(
-                    "OpenCode: 未找到可注入的灰度模型（检查 platform=opencode 或 codex 自定义 Provider）"
-                );
-            }
-            continue;
-        }
-
         let Some(platform) = find_platform_models(&response, tool.id) else {
             continue;
         };
@@ -2118,6 +1531,21 @@ fn is_zwitch_managed_custom_model_env_key(key: &str) -> bool {
     key == CLAUDE_CUSTOM_MODEL_ENV_PREFIX
         || key.starts_with(&format!("{CLAUDE_CUSTOM_MODEL_ENV_PREFIX}_"))
         || key == CLAUDE_GATEWAY_DISCOVERY_ENV
+        || key == CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_ENV
+}
+
+fn strip_injected_claude_env(value: &mut Value) {
+    let Some(env) = value.get_mut("env").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let managed_keys: Vec<String> = env
+        .keys()
+        .filter(|key| is_zwitch_managed_custom_model_env_key(key))
+        .cloned()
+        .collect();
+    for key in managed_keys {
+        env.remove(&key);
+    }
 }
 
 fn claude_custom_model_env_keys(index: usize) -> (String, String, String) {
@@ -2137,46 +1565,6 @@ fn claude_custom_model_env_keys(index: usize) -> (String, String, String) {
     }
 }
 
-fn inject_claude_grayscale_models(value: &mut Value, additional_models: &[GrayscaleModelEntry]) {
-    let env = ensure_json_env_object(value);
-
-    let managed_keys: Vec<String> = env
-        .keys()
-        .filter(|key| is_zwitch_managed_custom_model_env_key(key))
-        .cloned()
-        .collect();
-    for key in managed_keys {
-        env.remove(&key);
-    }
-
-    if !additional_models.is_empty() {
-        env.insert(
-            CLAUDE_GATEWAY_DISCOVERY_ENV.to_string(),
-            Value::String("1".to_string()),
-        );
-    } else {
-        env.remove(CLAUDE_GATEWAY_DISCOVERY_ENV);
-    }
-
-    for (index, model) in prioritize_grayscale_default_model(additional_models)
-        .iter()
-        .enumerate()
-    {
-        let (id_key, name_key, description_key) = claude_custom_model_env_keys(index);
-        let description = if model.key_name.is_empty() {
-            "灰度模型".to_string()
-        } else {
-            format!("{}（灰度）", model.key_name)
-        };
-        env.insert(id_key, Value::String(model.id.clone()));
-        env.insert(
-            name_key,
-            Value::String(grayscale_model_display_name(&model.id)),
-        );
-        env.insert(description_key, Value::String(description));
-    }
-}
-
 fn ensure_json_env_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
     let root = value.as_object_mut().expect("settings root must be object");
     if !root.contains_key("env") {
@@ -2185,6 +1573,32 @@ fn ensure_json_env_object(value: &mut Value) -> &mut serde_json::Map<String, Val
     root.get_mut("env")
         .and_then(Value::as_object_mut)
         .expect("env must be object")
+}
+
+fn inject_claude_grayscale_models(value: &mut Value, additional_models: &[GrayscaleModelEntry]) {
+    if additional_models.is_empty() {
+        return;
+    }
+
+    let env = ensure_json_env_object(value);
+    env.insert(
+        CLAUDE_DISABLE_NONESSENTIAL_TRAFFIC_ENV.to_string(),
+        Value::String("1".to_string()),
+    );
+    env.insert(
+        CLAUDE_GATEWAY_DISCOVERY_ENV.to_string(),
+        Value::String("1".to_string()),
+    );
+
+    for (index, model) in prioritize_grayscale_default_model(additional_models)
+        .iter()
+        .enumerate()
+    {
+        let (id_key, name_key, description_key) = claude_custom_model_env_keys(index);
+        env.insert(id_key, Value::String(model.id.clone()));
+        env.insert(name_key, Value::String(model.id.clone()));
+        env.insert(description_key, Value::String(model.id.clone()));
+    }
 }
 
 fn codex_grayscale_catalog_path(home: &Path) -> PathBuf {
@@ -2314,6 +1728,14 @@ fn legacy_codex_provider_table_header() -> &'static str {
     "[model_providers.zsdx_ai]"
 }
 
+fn codex_provider_table_header() -> &'static str {
+    "[model_providers.zwitch]"
+}
+
+fn is_managed_codex_model_provider(provider: &str) -> bool {
+    provider == CODEX_MODEL_PROVIDER || provider == LEGACY_CODEX_MODEL_PROVIDER
+}
+
 fn codex_config_fields() -> &'static [&'static str] {
     CODEX_CONFIG_FIELDS
 }
@@ -2337,9 +1759,14 @@ fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str
     };
     let openai_base_url_backup = read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
         .unwrap_or_else(|| BACKUP_ABSENT.to_string());
+    let base_url_backup = read_top_level_toml_value(content, CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY)
+        .unwrap_or_else(|| BACKUP_ABSENT.to_string());
+    let wire_api_backup = read_top_level_toml_value(content, "wire_api")
+        .unwrap_or_else(|| BACKUP_ABSENT.to_string());
     let catalog_backup = read_top_level_toml_value(content, "model_catalog_json")
         .unwrap_or_else(|| BACKUP_ABSENT.to_string());
-    let section_backup = extract_toml_section(content, legacy_codex_provider_table_header())
+    let section_backup = extract_toml_section(content, codex_provider_table_header())
+        .or_else(|| extract_toml_section(content, legacy_codex_provider_table_header()))
         .unwrap_or_else(|| BACKUP_ABSENT.to_string());
 
     for field in codex_config_fields() {
@@ -2352,11 +1779,13 @@ fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str
         }
         let stored = match *field {
             "openai_base_url" => openai_base_url_backup.clone(),
+            "base_url" => base_url_backup.clone(),
+            "wire_api" => wire_api_backup.clone(),
             "model" => model_backup.clone(),
             "model_provider" => provider_backup.clone(),
             "model_field_order" => order_backup.clone(),
             "model_catalog_json" => catalog_backup.clone(),
-            "model_providers.zsdx_ai" => section_backup.clone(),
+            "model_providers.zwitch" => section_backup.clone(),
             _ => BACKUP_ABSENT.to_string(),
         };
         entry.insert(backup_field_key, stored);
@@ -2366,6 +1795,19 @@ fn backup_codex_provider_toml(entry: &mut HashMap<String, String>, tool_id: &str
 fn is_zwitch_injected(content: &str) -> bool {
     if read_top_level_toml_value(content, CODEX_OPENAI_BASE_URL_KEY)
         .is_some_and(|url| is_local_proxy_base_url(&url, "codex"))
+    {
+        return true;
+    }
+
+    if read_top_level_toml_value(content, CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY)
+        .is_some_and(|url| is_local_proxy_base_url(&url, "codex"))
+    {
+        return true;
+    }
+
+    if read_top_level_toml_value(content, "model_provider")
+        .as_deref()
+        .is_some_and(is_managed_codex_model_provider)
     {
         return true;
     }
@@ -2436,8 +1878,8 @@ fn rebuild_codex_config(
     field_order: &[String],
     provider_section_body: Option<&str>,
 ) -> Result<String, String> {
-    let header = legacy_codex_provider_table_header();
-    let mut without_managed = remove_toml_section(content, header);
+    let mut without_managed = remove_toml_section(content, codex_provider_table_header());
+    without_managed = remove_toml_section(&without_managed, legacy_codex_provider_table_header());
     for key in ["model", "model_provider"] {
         without_managed = remove_top_level_toml_key(&without_managed, key);
     }
@@ -2466,7 +1908,7 @@ fn rebuild_codex_config(
         if out.last().map(|line| line.trim().is_empty()) != Some(true) {
             out.push(String::new());
         }
-        out.push(header.to_string());
+        out.push(codex_provider_table_header().to_string());
         out.extend(
             body.lines()
                 .filter(|line| !line.trim().is_empty())
@@ -2484,7 +1926,7 @@ fn rebuild_codex_config(
     Ok(normalize_toml_newlines(&out.join("\n")))
 }
 
-fn backup_claude_grayscale_env(
+fn backup_claude_managed_env(
     entry: &mut HashMap<String, String>,
     tool_id: &str,
     value: &Value,
@@ -2560,7 +2002,7 @@ fn restore_codex_provider_toml(
     }
 
     let stripped = strip_injected_codex_config(content);
-    let (model, model_provider, field_order, catalog_json, openai_base_url) =
+    let (model, model_provider, field_order, catalog_json, openai_base_url, base_url, wire_api) =
         sanitized_codex_restore_fields(file_backup, tool_id);
 
     let mut restored = if model.is_none() && model_provider.is_none() {
@@ -2577,6 +2019,14 @@ fn restore_codex_provider_toml(
 
     if let Some(url) = openai_base_url {
         restored = upsert_top_level_toml_key(&restored, CODEX_OPENAI_BASE_URL_KEY, &url)?;
+    }
+
+    if let Some(url) = base_url {
+        restored = upsert_top_level_toml_key(&restored, CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY, &url)?;
+    }
+
+    if let Some(value) = wire_api {
+        restored = upsert_top_level_toml_key(&restored, "wire_api", &value)?;
     }
 
     if let Some(catalog_json) = catalog_json {
@@ -2597,13 +2047,15 @@ fn sanitized_codex_restore_fields(
     Vec<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
 ) {
     let model_raw = file_backup.get(&backup_key(tool_id, "model"));
     let provider_raw = file_backup.get(&backup_key(tool_id, "model_provider"));
 
     let provider_was_injected = provider_raw
         .map(String::as_str)
-        .is_some_and(|value| value == LEGACY_CODEX_MODEL_PROVIDER);
+        .is_some_and(|value| is_managed_codex_model_provider(value));
 
     let model = model_raw.and_then(|value| {
         if value == BACKUP_ABSENT || provider_was_injected {
@@ -2613,7 +2065,7 @@ fn sanitized_codex_restore_fields(
     });
 
     let model_provider = provider_raw.and_then(|value| {
-        if value == BACKUP_ABSENT || value == LEGACY_CODEX_MODEL_PROVIDER {
+        if value == BACKUP_ABSENT || is_managed_codex_model_provider(value) {
             return None;
         }
         Some(value.clone())
@@ -2646,11 +2098,40 @@ fn sanitized_codex_restore_fields(
             }
         });
 
-    (model, model_provider, field_order, catalog_json, openai_base_url)
+    let base_url = file_backup
+        .get(&backup_key(tool_id, "base_url"))
+        .and_then(|value| {
+            if value == BACKUP_ABSENT {
+                None
+            } else {
+                Some(value.clone())
+            }
+        });
+
+    let wire_api = file_backup
+        .get(&backup_key(tool_id, "wire_api"))
+        .and_then(|value| {
+            if value == BACKUP_ABSENT {
+                None
+            } else {
+                Some(value.clone())
+            }
+        });
+
+    (
+        model,
+        model_provider,
+        field_order,
+        catalog_json,
+        openai_base_url,
+        base_url,
+        wire_api,
+    )
 }
 
 fn strip_injected_codex_config(content: &str) -> String {
-    let mut result = remove_toml_section(content, legacy_codex_provider_table_header());
+    let mut result = remove_toml_section(content, codex_provider_table_header());
+    result = remove_toml_section(&result, legacy_codex_provider_table_header());
 
     if read_top_level_toml_value(&result, CODEX_OPENAI_BASE_URL_KEY)
         .is_some_and(|url| is_local_proxy_base_url(&url, "codex"))
@@ -2658,10 +2139,19 @@ fn strip_injected_codex_config(content: &str) -> String {
         result = remove_top_level_toml_key(&result, CODEX_OPENAI_BASE_URL_KEY);
     }
 
-    if read_top_level_toml_value(&result, "model_provider").as_deref()
-        == Some(LEGACY_CODEX_MODEL_PROVIDER)
+    let had_managed_top_level_base_url = read_top_level_toml_value(&result, CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY)
+        .is_some_and(|url| is_zwitch_managed_codex_top_level_base_url(&url));
+    if had_managed_top_level_base_url {
+        result = remove_top_level_toml_key(&result, CODEX_LEGACY_TOP_LEVEL_BASE_URL_KEY);
+        result = remove_top_level_toml_key(&result, "wire_api");
+    }
+
+    if read_top_level_toml_value(&result, "model_provider")
+        .as_deref()
+        .is_some_and(is_managed_codex_model_provider)
     {
         result = remove_top_level_toml_key(&result, "model_provider");
+        result = remove_top_level_toml_key(&result, "model");
     }
 
     result = remove_managed_codex_model_catalog(&result);
@@ -2897,646 +2387,33 @@ mod tests {
         }
     }
 
-    fn opencode_platform(models: Vec<GrayscaleModelEntry>) -> GrayscalePlatformModels {
-        GrayscalePlatformModels {
-            id: "opencode".into(),
-            label: "OpenCode".into(),
-            base_path: "/openai".into(),
-            injection_mode: "append".into(),
-            models: vec![],
-            additional_models: models,
-        }
-    }
-
     #[test]
-    fn extend_opencode_platform_adds_openai_models() {
-        let platform = opencode_platform(vec![grayscale_model(
-            "claude-mythos-preview",
-            "claude",
-            "claude",
-        )]);
-        let extended = extend_opencode_platform_with_openai_models(&platform);
-        let ids: Vec<_> = extended
-            .additional_models
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect();
-        assert!(ids.contains(&"gpt-5.5"));
-        assert!(ids.contains(&"gpt-5.4"));
-        assert!(ids.contains(&"gpt-5.4-mini"));
-        assert_eq!(extended.additional_models.len(), 4);
-    }
+    fn opencode_restore_removes_injected_providers() {
+        let original = r#"{"provider":{"local":{"npm":"@ai-sdk/openai-compatible"}}}"#;
+        let injected = r#"{"provider":{"local":{"npm":"@ai-sdk/openai-compatible"},"灰度":{"npm":"@ai-sdk/openai","options":{"baseURL":"http://127.0.0.1:51805/opencode/openai/v1"}}}}"#;
 
-    #[test]
-    fn extend_opencode_platform_deduplicates_by_model_id() {
-        let platform =
-            opencode_platform(vec![grayscale_model("gpt-5.4", "openai", "openai")]);
-        let extended = extend_opencode_platform_with_openai_models(&platform);
-        let count = extended
-            .additional_models
-            .iter()
-            .filter(|model| model.id == "gpt-5.4")
-            .count();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn image_incapable_models_excludes_openai_provider() {
-        let platform = opencode_platform(vec![
-            grayscale_model("claude-mythos-preview-fast", "claude", "claude"),
-            grayscale_model("claude-mythos-preview", "claude", "claude"),
-        ]);
-        let extended = extend_opencode_platform_with_openai_models(&platform);
-        let incapable = opencode_image_incapable_models(&extended);
-        assert_eq!(
-            incapable,
-            vec![
-                "灰度/claude-mythos-preview".to_string(),
-                "灰度/claude-mythos-preview-fast".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn zwitch_openai_provider_uses_codex_local_proxy_base() {
-        let platform = opencode_platform(vec![grayscale_model(
-            "claude-mythos-preview",
-            "claude",
-            "claude",
-        )]);
-        let extended = extend_opencode_platform_with_openai_models(&platform);
-        let (providers, managed_keys) =
-            build_opencode_providers_config("http://127.0.0.1:51805/opencode", &extended);
-        let providers = providers.as_object().unwrap();
-
-        let openai = providers
-            .get(OPENCODE_OPENAI_PROVIDER_KEY)
-            .unwrap()
-            .as_object()
-            .unwrap();
-        assert_eq!(
-            openai
-                .get("options")
-                .and_then(|options| options.get("baseURL"))
-                .and_then(Value::as_str),
-            Some("http://127.0.0.1:51805/codex/v1")
-        );
-        let models = openai.get("models").unwrap().as_object().unwrap();
-        assert!(models.contains_key("gpt-5.5"));
-        assert!(models.contains_key("gpt-5.4"));
-        assert!(models.contains_key("gpt-5.4-mini"));
-
-        // OpenAI 模型必须声明视觉能力，否则 OpenCode 会在客户端剥离图片。
-        let gpt54 = models.get("gpt-5.4").unwrap();
-        assert_eq!(gpt54.get("attachment").and_then(Value::as_bool), Some(true));
-        let input_modalities = gpt54["modalities"]["input"].as_array().unwrap();
-        assert!(input_modalities.iter().any(|v| v == "image"));
-
-        // 灰度 Provider 仍走 opencode 前缀。
-        let grayscale = providers.get("灰度").unwrap();
-        assert_eq!(
-            grayscale
-                .get("options")
-                .and_then(|options| options.get("baseURL"))
-                .and_then(Value::as_str),
-            Some("http://127.0.0.1:51805/opencode/openai/v1")
-        );
-
-        // Codex 前缀的 baseURL 也要被识别为受管 Provider，确保还原时能移除。
-        assert!(managed_keys.contains(&OPENCODE_OPENAI_PROVIDER_KEY.to_string()));
-        assert!(is_local_proxy_opencode_provider_base_url(
-            "http://127.0.0.1:51805/codex/v1"
-        ));
-    }
-
-    #[test]
-    fn image_proxy_config_points_reader_to_openai_gpt54() {
-        let platform = opencode_platform(vec![grayscale_model(
-            "claude-mythos-preview",
-            "claude",
-            "claude",
-        )]);
-        let config = build_opencode_image_proxy_config(&platform);
-        assert_eq!(
-            config["imageReaderModel"]["providerID"].as_str(),
-            Some("zwitch-openai")
-        );
-        assert_eq!(
-            config["imageReaderModel"]["modelID"].as_str(),
-            Some("gpt-5.4")
-        );
-        assert!(config["analysisPrompt"]
-            .as_str()
-            .unwrap()
-            .starts_with("The user has pasted an image"));
-    }
-
-    #[test]
-    fn sync_image_proxy_rewrites_legacy_grayscale_prefixes() {
-        let dir = std::env::temp_dir().join(format!("zwitch-opencode-image-proxy-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let config_path = dir.join("opencode-image-proxy.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "imageIncapableModels": [
-    "zai-coding-plan/glm-4.6",
-    "灰度 Mythos/claude-mythos-preview-fast",
-    "claude/claude-mythos-preview"
-  ],
-  "imageReaderModel": { "providerID": "zwitch-openai", "modelID": "gpt-5.4" }
-}"#,
-        )
-        .unwrap();
-
-        let platform = opencode_platform(vec![
-            grayscale_model("claude-mythos-preview-fast", "claude", "灰度 Mythos"),
-            grayscale_model("claude-mythos-preview", "claude", "claude"),
-        ]);
-        sync_opencode_image_proxy_incapable_models(&config_path, &platform).unwrap();
-
-        let value: Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        let models: Vec<&str> = value["imageIncapableModels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(models.contains(&"zai-coding-plan/glm-4.6"));
-        assert!(models.contains(&"灰度/claude-mythos-preview-fast"));
-        assert!(models.contains(&"灰度/claude-mythos-preview"));
-        assert!(!models.iter().any(|entry| entry.starts_with("灰度 Mythos/")));
-        assert!(!models.iter().any(|entry| entry.starts_with("claude/")));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cli_tool_status_reports_install_metadata() {
-        let tool = &TOOLS[0];
-        let status = CliToolStatus {
-            id: tool.id.to_string(),
-            name: tool.name.to_string(),
-            supported: true,
-            installed: is_tool_installed(tool),
-            install_shell: tool.install_shell.to_string(),
-            quick_start_doc_url: tool.quick_start_doc_url.to_string(),
-            config_enabled: true,
-            has_grayscale: false,
-            config_path: "/tmp/config".to_string(),
-            base_url_field: tool.base_url_field.to_string(),
-            token_field: tool.token_field.to_string(),
-        };
-        assert_eq!(
-            status.install_shell,
-            "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
-        );
-        assert_eq!(
-            status.quick_start_doc_url,
-            "https://developers.openai.com/codex/cli"
-        );
-    }
-
-    #[test]
-    fn tool_config_defaults_to_disabled() {
-        let settings = StoredSettings::default();
-        assert!(!is_tool_config_enabled(&settings, "codex"));
-        assert!(!is_tool_config_enabled(&settings, "claude"));
-        assert!(!tool_should_inject(&settings, &TOOLS[0]));
-    }
-
-    #[test]
-    fn tool_config_switch_persists_enabled_state() {
-        let mut settings = StoredSettings {
-            proxy_enabled: true,
-            tool_switches: HashMap::from([
-                (String::from("codex"), true),
-                (String::from("claude"), false),
-            ]),
-        };
-        assert!(is_tool_config_enabled(&settings, "codex"));
-        assert!(!is_tool_config_enabled(&settings, "claude"));
-        assert!(tool_should_inject(&settings, &TOOLS[0]));
-        assert!(!tool_should_inject(&settings, &TOOLS[1]));
-
-        settings.tool_switches.insert(String::from("claude"), true);
-        assert!(tool_should_inject(&settings, &TOOLS[1]));
-    }
-
-    #[test]
-    fn codex_uses_openai_base_url_field() {
-        assert_eq!(TOOLS[0].base_url_field, "openai_base_url");
-        assert_eq!(TOOLS[0].token_field, "OPENAI_API_KEY");
-        assert!(matches!(
-            CODEX_TARGETS[0].format,
-            ConfigFormat::CodexProviderToml
-        ));
-    }
-
-    #[test]
-    fn codex_inject_writes_openai_base_url() {
-        let injected =
-            inject_codex_openai_proxy_config("", "http://127.0.0.1:51805/codex").unwrap();
-        assert_eq!(
-            injected,
-            r#"openai_base_url = "http://127.0.0.1:51805/codex"
-"#
-        );
-    }
-
-    #[test]
-    fn codex_inject_preserves_model_provider_and_other_tables() {
-        let original = r#"model_provider = "bifrost"
-model = "gpt-5.4"
-
-[model_providers.bifrost]
-base_url = "http://127.0.0.1:51805/codex"
-"#;
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:9999/codex").unwrap();
-        assert!(injected.contains(r#"openai_base_url = "http://127.0.0.1:9999/codex""#));
-        assert!(injected.contains(r#"model_provider = "bifrost""#));
-        assert!(injected.contains(r#"model = "gpt-5.4""#));
-        assert!(injected.contains("[model_providers.bifrost]"));
-        assert!(!injected.contains("[model_providers.zsdx_ai]"));
-    }
-
-    #[test]
-    fn codex_inject_migrates_legacy_zsdx_ai_provider() {
-        let legacy = r#"model_provider = "zsdx_ai"
-
-[model_providers.zsdx_ai]
-name = "ZSDX AI"
-base_url = "http://127.0.0.1:51805/codex"
-wire_api = "responses"
-"#;
-        let injected =
-            inject_codex_openai_proxy_config(legacy, "http://127.0.0.1:9999/codex").unwrap();
-        assert!(injected.contains(r#"openai_base_url = "http://127.0.0.1:9999/codex""#));
-        assert!(!injected.contains("model_provider"));
-        assert!(!injected.contains("[model_providers.zsdx_ai]"));
-    }
-
-    #[test]
-    fn codex_restore_removes_injected_config() {
-        let original = r#"disable_response_storage = true
-
-[model_providers.bifrost]
-base_url = "http://old.example/codex"
-"#;
         let mut backup = HashMap::new();
-        backup_codex_provider_toml(&mut backup, "codex", original);
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
-        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
-        assert_eq!(restored, original);
+        backup_opencode_providers(&mut backup, "opencode", original);
+        let restored = restore_opencode_providers(injected, "opencode", &backup).unwrap();
+        let restored_value: Value = serde_json::from_str(&restored).unwrap();
+        let providers = restored_value.get("provider").unwrap().as_object().unwrap();
+        assert!(providers.contains_key("local"));
+        assert!(!providers.contains_key("灰度"));
     }
 
     #[test]
-    fn codex_restore_puts_back_replaced_top_level_keys() {
-        let original = r#"model = "gpt-5.4"
-model_provider = "bifrost"
-"#;
-        let mut backup = HashMap::new();
-        backup_codex_provider_toml(&mut backup, "codex", original);
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
-        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
-        assert_eq!(restored, original);
-    }
-
-    #[test]
-    fn codex_restore_preserves_model_field_order() {
-        let original = r#"model_provider = "bifrost"
-model = "gpt-5.4"
-"#;
-        let mut backup = HashMap::new();
-        backup_codex_provider_toml(&mut backup, "codex", original);
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
-        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
-        assert_eq!(restored, original);
-    }
-
-    #[test]
-    fn codex_restore_without_backup_strips_injected_values() {
-        let injected = inject_codex_openai_proxy_config(
-            r#"disable_response_storage = true
-"#,
-            "http://127.0.0.1:51805/codex",
-        )
-        .unwrap();
-        let restored = restore_codex_provider_toml(&injected, "codex", &HashMap::new()).unwrap();
-        assert_eq!(restored, "disable_response_storage = true\n");
-    }
-
-    #[test]
-    fn codex_restore_clears_stale_injected_backup() {
-        let original = r#"disable_response_storage = true
-
-[model_providers.bifrost]
-base_url = "http://old.example/codex"
-"#;
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
-
-        let mut stale_backup = HashMap::new();
-        stale_backup.insert("codex::model_provider".into(), LEGACY_CODEX_MODEL_PROVIDER.into());
-
-        let restored = restore_codex_provider_toml(&injected, "codex", &stale_backup).unwrap();
-        assert_eq!(restored, original);
-    }
-
-    #[test]
-    fn codex_backup_skips_already_injected_config() {
-        let injected =
-            inject_codex_openai_proxy_config("", "http://127.0.0.1:51805/codex").unwrap();
-        let mut backup = HashMap::new();
-        backup.insert("codex::model".into(), BACKUP_ABSENT.into());
-        backup_codex_provider_toml(&mut backup, "codex", &injected);
-        assert_eq!(
-            backup.get("codex::model").map(String::as_str),
-            Some(BACKUP_ABSENT)
-        );
-        assert!(!backup.contains_key("codex::snapshot"));
-    }
-
-    #[test]
-    fn codex_restore_uses_snapshot_when_available() {
-        let original = "disable_response_storage = true\n";
-        let mut backup = HashMap::new();
-        backup.insert("codex::snapshot".into(), original.into());
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
-        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
-        assert_eq!(restored, original);
-    }
-
-    #[test]
-    fn codex_restore_puts_back_openai_base_url() {
-        let original = r#"openai_base_url = "https://api.openai.com/v1"
-"#;
-        let mut backup = HashMap::new();
-        backup_codex_provider_toml(&mut backup, "codex", original);
-        let injected =
-            inject_codex_openai_proxy_config(original, "http://127.0.0.1:51805/codex").unwrap();
-        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
-        assert_eq!(restored, original);
-    }
-
-    #[test]
-    fn detects_claude_local_proxy_injection() {
-        let content = r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:51805/claude"}}"#;
-        assert!(is_target_injected(&TOOLS[1], &CLAUDE_TARGETS[0], content));
-        assert_eq!(
-            read_injected_proxy_port(&TOOLS[1], &CLAUDE_TARGETS[0], content),
-            Some(51805)
-        );
-    }
-
-    #[test]
-    fn claude_only_uses_env_block_fields() {
-        assert_eq!(CLAUDE_TARGETS[0].fields.len(), 1);
-        assert_eq!(CLAUDE_TARGETS[0].fields[0].path, "env.ANTHROPIC_BASE_URL");
-    }
-
-    #[test]
-    fn executable_search_dirs_include_common_locations() {
-        let dirs = collect_executable_search_dirs();
-        assert!(dirs.iter().any(|dir| dir.ends_with("homebrew/bin")));
-        assert!(dirs.iter().any(|dir| dir.ends_with(".local/bin")));
-    }
-
-    #[test]
-    fn append_nested_bin_dirs_collects_fnm_node_versions() {
-        let base = std::env::temp_dir().join(format!("zwitch-fnm-test-{}", std::process::id()));
-        let bin_dir = base.join("v22.0.0/installation/bin");
-        fs::create_dir_all(&bin_dir).expect("create fnm test dir");
-        let mut dirs = Vec::new();
-        let mut push = |dir: PathBuf| dirs.push(dir);
-        append_nested_bin_dirs(&base, &["installation", "bin"], &mut push);
-        assert!(dirs.iter().any(|dir| dir == &bin_dir));
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn find_binary_resolves_known_cli_tools() {
-        if find_binary(&["codex"]).is_none() && find_binary(&["claude"]).is_none() {
-            return;
-        }
-        assert!(
-            find_binary(&["codex"]).is_some() || find_binary(&["claude"]).is_some()
-        );
-    }
-
-    #[test]
-    fn executable_search_dirs_include_opencode_install_path() {
-        let home = dirs::home_dir().expect("home dir");
-        let dirs = collect_executable_search_dirs();
-        assert!(
-            dirs.iter().any(|dir| dir == &home.join(".opencode/bin")),
-            "expected ~/.opencode/bin in executable search dirs"
-        );
-    }
-
-    #[test]
-    fn opencode_install_detection_matches_tool_definition() {
-        let tool = TOOLS
-            .iter()
-            .find(|tool| tool.id == "opencode")
-            .expect("opencode tool");
-        let installed = is_tool_installed(tool);
-        let via_paths = opencode_installed_at_known_paths();
-        let via_binary = find_binary(tool.binaries).is_some();
-        assert_eq!(
-            installed,
-            via_paths || via_binary,
-            "is_tool_installed should combine PATH lookup and known install paths"
-        );
-    }
-
-    #[test]
-    fn cli_install_detection_matches_tool_definition() {
-        for tool in TOOLS {
-            let installed = is_tool_installed(tool);
-            let via_paths = tool_installed_at_known_paths(tool.id);
-            let via_binary = find_binary(tool.binaries).is_some();
-            assert_eq!(
-                installed,
-                via_paths || via_binary,
-                "{} install detection should combine PATH lookup and known install paths",
-                tool.id
-            );
-        }
-    }
-
-    #[test]
-    fn any_file_in_versioned_subdirs_detects_nested_desktop_cli() {
-        let dir = std::env::temp_dir().join(format!(
-            "zwitch-desktop-cli-detect-{}",
-            std::process::id()
-        ));
-        let version_dir = dir.join("2.1.0");
-        let claude_bin = version_dir
-            .join("claude.app")
-            .join("Contents")
-            .join("MacOS")
-            .join("claude");
-        fs::create_dir_all(claude_bin.parent().unwrap()).unwrap();
-        fs::write(&claude_bin, b"#!/bin/sh\n").unwrap();
-
-        assert!(any_file_in_versioned_subdirs(
-            &dir,
-            &["claude.app", "Contents", "MacOS", "claude"]
-        ));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn any_nonempty_file_in_dir_ignores_empty_markers() {
-        let dir = std::env::temp_dir().join(format!(
-            "zwitch-claude-versions-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("2.1.0"), b"").unwrap();
-
-        assert!(!any_nonempty_file_in_dir(&dir));
-
-        fs::write(dir.join("2.1.1"), b"fake-binary").unwrap();
-        assert!(any_nonempty_file_in_dir(&dir));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn electron_app_data_installed_checks_xdg_and_data_dirs() {
-        let dir = std::env::temp_dir().join(format!(
-            "zwitch-electron-app-data-{}",
-            std::process::id()
-        ));
-        let app_id = "ai.opencode.desktop";
-        let app_data = dir.join(".config").join(app_id);
-        fs::create_dir_all(&app_data).unwrap();
-
-        assert!(electron_app_data_installed(&dir, app_id));
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cli_candidate_paths_include_windows_exe_suffix() {
-        let home = PathBuf::from("/tmp/home");
-        let paths = cli_candidate_paths(&home, "claude");
-        assert!(paths.iter().any(|path| path.ends_with("claude")));
-        #[cfg(windows)]
-        assert!(paths.iter().any(|path| path.ends_with("claude.exe")));
-    }
-
-    #[test]
-    fn windows_claude_msix_installed_detects_package_dir() {
-        let dir = std::env::temp_dir().join(format!(
-            "zwitch-claude-msix-{}",
-            std::process::id()
-        ));
-        let packages = dir.join("Packages");
-        fs::create_dir_all(packages.join("Claude_pzs8sxrjxfjjc")).unwrap();
-
-        #[cfg(windows)]
-        {
-            std::env::set_var("LOCALAPPDATA", &dir);
-            assert!(windows_claude_msix_installed());
-            std::env::remove_var("LOCALAPPDATA");
-        }
-
-        #[cfg(not(windows))]
-        {
-            assert!(!windows_claude_msix_installed());
-        }
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn claude_prioritizes_default_grayscale_model() {
-        let mut value = serde_json::json!({ "env": {} });
-        inject_claude_grayscale_models(
-            &mut value,
-            &[
-                GrayscaleModelEntry {
-                    id: "claude-mythos-preview".into(),
-                    provider: "anthropic".into(),
-                    key_id: String::new(),
-                    key_name: String::new(),
-                    source: "grayscale".into(),
-                    api: None,
-                    base_path: None,
-                    context_window: None,
-                    max_tokens: None,
-                },
-                GrayscaleModelEntry {
-                    id: "claude-mythos-preview-fast".into(),
-                    provider: "anthropic".into(),
-                    key_id: String::new(),
-                    key_name: String::new(),
-                    source: "grayscale".into(),
-                    api: None,
-                    base_path: None,
-                    context_window: None,
-                    max_tokens: None,
-                },
-            ],
-        );
-        let env = value.get("env").unwrap().as_object().unwrap();
-        assert_eq!(
-            env.get("ANTHROPIC_CUSTOM_MODEL_OPTION")
-                .and_then(Value::as_str),
-            Some("claude-mythos-preview-fast")
-        );
-    }
-
-    #[test]
-    fn opencode_sets_default_model_selector() {
-        let platform = opencode_test_platform(vec![
-            GrayscaleModelEntry {
-                id: "claude-mythos-preview".into(),
-                provider: "claude".into(),
-                key_id: "gray-claude-key".into(),
-                key_name: "claude".into(),
-                source: "grayscale".into(),
-                api: Some("openai-responses".into()),
-                base_path: Some("/openai".into()),
-                context_window: None,
-                max_tokens: None,
-            },
-            GrayscaleModelEntry {
-                id: "claude-mythos-preview-fast".into(),
-                provider: "claude".into(),
-                key_id: "gray-claude-key".into(),
-                key_name: "claude".into(),
-                source: "grayscale".into(),
-                api: Some("openai-responses".into()),
-                base_path: Some("/openai".into()),
-                context_window: None,
-                max_tokens: None,
-            },
-        ]);
-        assert_eq!(
-            resolve_opencode_default_model(&platform).as_deref(),
-            Some("灰度/claude-mythos-preview-fast")
-        );
-    }
-
-    #[test]
-    fn claude_injects_grayscale_models_into_env() {
-        let mut value = serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "http://example" } });
+    fn claude_injects_grayscale_models_without_touching_auth_token() {
+        let mut value = serde_json::json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                "ANTHROPIC_AUTH_TOKEN": "user-secret-token"
+            }
+        });
         let models = vec![GrayscaleModelEntry {
-            id: "claude-sonnet-4-5".into(),
+            id: "claude-fable-5".into(),
             provider: "anthropic".into(),
-            key_id: "gray-anthropic".into(),
-            key_name: "灰度 Anthropic".into(),
+            key_id: String::new(),
+            key_name: String::new(),
             source: "grayscale".into(),
             api: None,
             base_path: None,
@@ -3546,347 +2423,23 @@ base_url = "http://old.example/codex"
         inject_claude_grayscale_models(&mut value, &models);
         let env = value.get("env").unwrap().as_object().unwrap();
         assert_eq!(
-            env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
-                .and_then(Value::as_str),
-            Some("1")
+            env.get("ANTHROPIC_AUTH_TOKEN").and_then(Value::as_str),
+            Some("user-secret-token")
         );
         assert_eq!(
             env.get("ANTHROPIC_CUSTOM_MODEL_OPTION").and_then(Value::as_str),
-            Some("claude-sonnet-4-5")
+            Some("claude-fable-5")
         );
         assert_eq!(
             env.get("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
                 .and_then(Value::as_str),
-            Some("Claude Sonnet 4 5")
-        );
-    }
-
-    #[test]
-    fn claude_skips_gateway_discovery_without_grayscale_models() {
-        let mut value = serde_json::json!({ "env": { "ANTHROPIC_BASE_URL": "http://example" } });
-        inject_claude_grayscale_models(&mut value, &[]);
-        let env = value.get("env").unwrap().as_object().unwrap();
-        assert!(!env.contains_key("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"));
-        assert!(!env.contains_key("ANTHROPIC_CUSTOM_MODEL_OPTION"));
-    }
-
-    fn opencode_test_platform(models: Vec<GrayscaleModelEntry>) -> GrayscalePlatformModels {
-        GrayscalePlatformModels {
-            id: "opencode".into(),
-            label: String::new(),
-            base_path: "/openai".into(),
-            injection_mode: String::new(),
-            models: vec![],
-            additional_models: models,
-        }
-    }
-
-    #[test]
-    fn opencode_provider_key_uses_unified_grayscale_name() {
-        let models = vec![GrayscaleModelEntry {
-            id: "claude-mythos-preview".into(),
-            provider: "测试".into(),
-            key_id: "gray-key-1".into(),
-            key_name: "灰度 Mythos".into(),
-            source: "grayscale".into(),
-            api: None,
-            base_path: None,
-            context_window: None,
-            max_tokens: None,
-        }];
-        assert_eq!(opencode_provider_key_from_models(&models), "灰度");
-    }
-
-    #[test]
-    fn opencode_builds_custom_provider_config_from_grayscale_models() {
-        let platform = opencode_test_platform(vec![
-            GrayscaleModelEntry {
-                id: "claude-mythos-preview".into(),
-                provider: "claude".into(),
-                key_id: "gray-claude-key".into(),
-                key_name: "灰度 Claude".into(),
-                source: "grayscale".into(),
-                api: Some("openai-responses".into()),
-                base_path: Some("/openai".into()),
-                context_window: None,
-                max_tokens: None,
-            },
-            GrayscaleModelEntry {
-                id: "claude-mythos-preview-fast".into(),
-                provider: "claude".into(),
-                key_id: "gray-claude-key".into(),
-                key_name: "灰度 Claude".into(),
-                source: "grayscale".into(),
-                api: Some("openai-responses".into()),
-                base_path: Some("/openai".into()),
-                context_window: None,
-                max_tokens: None,
-            },
-        ]);
-
-        let (providers, managed_keys) =
-            build_opencode_providers_config("http://127.0.0.1:51805/opencode", &platform);
-        let providers = providers.as_object().unwrap();
-        let grayscale = providers.get("灰度").unwrap().as_object().unwrap();
-
-        assert_eq!(managed_keys, vec!["灰度"]);
-        assert_eq!(
-            grayscale.get("npm").and_then(Value::as_str),
-            Some(OPENCODE_OPENAI_RESPONSES_NPM)
+            Some("claude-fable-5")
         );
         assert_eq!(
-            grayscale.get("name").and_then(Value::as_str),
-            Some("灰度")
-        );
-        let models = grayscale.get("models").unwrap().as_object().unwrap();
-        assert_eq!(models.len(), 2);
-        assert_eq!(
-            models
-                .get("claude-mythos-preview")
-                .and_then(|entry| entry.get("name"))
+            env.get("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY")
                 .and_then(Value::as_str),
-            Some("Claude Mythos Preview（灰度）")
+            Some("1")
         );
-        assert!(models.contains_key("claude-mythos-preview"));
-        assert!(models.contains_key("claude-mythos-preview-fast"));
-    }
-
-    #[test]
-    fn opencode_grayscale_provider_display_name_is_unified() {
-        let models = vec![GrayscaleModelEntry {
-            id: "glm-4.6".into(),
-            provider: "zhipu".into(),
-            key_id: "gray-zhipu".into(),
-            key_name: "GLM".into(),
-            source: "grayscale".into(),
-            api: None,
-            base_path: None,
-            context_window: None,
-            max_tokens: None,
-        }];
-        assert_eq!(
-            opencode_grayscale_provider_display_name(&models),
-            "灰度"
-        );
-    }
-
-    #[test]
-    fn opencode_grayscale_provider_display_name_ignores_key_name_marker() {
-        let models = vec![GrayscaleModelEntry {
-            id: "claude-mythos-preview".into(),
-            provider: "claude".into(),
-            key_id: "gray-key".into(),
-            key_name: "灰度 Mythos".into(),
-            source: "grayscale".into(),
-            api: None,
-            base_path: None,
-            context_window: None,
-            max_tokens: None,
-        }];
-        assert_eq!(
-            opencode_grayscale_provider_display_name(&models),
-            "灰度"
-        );
-    }
-
-    #[test]
-    fn opencode_uses_openai_compatible_npm_for_completions() {
-        let platform = opencode_test_platform(vec![GrayscaleModelEntry {
-            id: "glm-4.6".into(),
-            provider: "zhipu".into(),
-            key_id: "gray-zhipu".into(),
-            key_name: "灰度 GLM".into(),
-            source: "grayscale".into(),
-            api: Some("openai-completions".into()),
-            base_path: Some("/openai".into()),
-            context_window: None,
-            max_tokens: None,
-        }]);
-        let (providers, _) =
-            build_opencode_providers_config("http://127.0.0.1:51805/opencode", &platform);
-        let provider = providers
-            .as_object()
-            .unwrap()
-            .get("灰度")
-            .unwrap()
-            .as_object()
-            .unwrap();
-        assert_eq!(
-            provider.get("npm").and_then(Value::as_str),
-            Some(OPENCODE_OPENAI_COMPATIBLE_NPM)
-        );
-    }
-
-    #[test]
-    fn opencode_model_entry_uses_api_context_limits_not_hardcoded_default() {
-        let entry = build_opencode_model_entry(&GrayscaleModelEntry {
-            id: "claude-mythos-preview".into(),
-            provider: "claude".into(),
-            key_id: "gray-claude-key".into(),
-            key_name: "灰度 Claude".into(),
-            source: "grayscale".into(),
-            api: None,
-            base_path: None,
-            context_window: Some(200_000),
-            max_tokens: Some(32_000),
-        });
-        let limit = entry.get("limit").unwrap().as_object().unwrap();
-        assert_eq!(limit.get("context").and_then(Value::as_u64), Some(200_000));
-        assert_eq!(limit.get("output").and_then(Value::as_u64), Some(32_000));
-        assert_eq!(
-            entry.get("name").and_then(Value::as_str),
-            Some("Claude Mythos Preview（灰度）")
-        );
-    }
-
-    #[test]
-    fn opencode_model_entry_defaults_context_when_api_missing() {
-        let entry = build_opencode_model_entry(&GrayscaleModelEntry {
-            id: "some-unknown-grayscale-model".into(),
-            provider: "claude".into(),
-            key_id: String::new(),
-            key_name: String::new(),
-            source: "grayscale".into(),
-            api: None,
-            base_path: None,
-            context_window: None,
-            max_tokens: None,
-        });
-        let limit = entry.get("limit").unwrap().as_object().unwrap();
-        assert_eq!(
-            limit.get("context").and_then(Value::as_u64),
-            Some(OPENCODE_DEFAULT_CONTEXT_WINDOW)
-        );
-        assert_eq!(
-            limit.get("output").and_then(Value::as_u64),
-            Some(OPENCODE_DEFAULT_MAX_OUTPUT)
-        );
-    }
-
-    #[test]
-    fn opencode_model_entry_uses_client_override_when_api_missing() {
-        for model_id in ["claude-mythos-preview", "claude-mythos-preview-fast"] {
-            let entry = build_opencode_model_entry(&GrayscaleModelEntry {
-                id: model_id.into(),
-                provider: "claude".into(),
-                key_id: String::new(),
-                key_name: String::new(),
-                source: "grayscale".into(),
-                api: None,
-                base_path: None,
-                context_window: None,
-                max_tokens: None,
-            });
-            let limit = entry.get("limit").unwrap().as_object().unwrap();
-            assert_eq!(
-                limit.get("context").and_then(Value::as_u64),
-                Some(1_000_000),
-                "{model_id} context"
-            );
-            assert_eq!(
-                limit.get("output").and_then(Value::as_u64),
-                Some(64_000),
-                "{model_id} output"
-            );
-        }
-    }
-
-    #[test]
-    fn opencode_model_entry_prefers_api_limits_over_client_override() {
-        let entry = build_opencode_model_entry(&GrayscaleModelEntry {
-            id: "claude-mythos-preview".into(),
-            provider: "claude".into(),
-            key_id: String::new(),
-            key_name: String::new(),
-            source: "grayscale".into(),
-            api: None,
-            base_path: None,
-            context_window: Some(200_000),
-            max_tokens: Some(32_000),
-        });
-        let limit = entry.get("limit").unwrap().as_object().unwrap();
-        assert_eq!(limit.get("context").and_then(Value::as_u64), Some(200_000));
-        assert_eq!(limit.get("output").and_then(Value::as_u64), Some(32_000));
-    }
-
-    #[test]
-    fn opencode_injection_replaces_existing_provider_with_same_name() {
-        let mut providers = serde_json::Map::new();
-        providers.insert(
-            "custom-claude".into(),
-            serde_json::json!({
-                "name": "灰度",
-                "npm": "@ai-sdk/openai",
-                "options": { "baseURL": "https://api.example.com/v1" }
-            }),
-        );
-
-        let (injected, _) = build_opencode_providers_config(
-            "http://127.0.0.1:51805/opencode",
-            &opencode_test_platform(vec![GrayscaleModelEntry {
-                id: "claude-mythos-preview".into(),
-                provider: "claude".into(),
-                key_id: "gray-claude-key".into(),
-                key_name: "claude".into(),
-                source: "grayscale".into(),
-                api: Some("openai-responses".into()),
-                base_path: Some("/openai".into()),
-                context_window: None,
-                max_tokens: None,
-            }]),
-        );
-
-        merge_opencode_injected_providers(&mut providers, &injected);
-
-        assert_eq!(providers.len(), 1);
-        assert!(providers.contains_key("灰度"));
-        assert!(!providers.contains_key("custom-claude"));
-        let provider = providers.get("灰度").unwrap();
-        assert_eq!(
-            provider
-                .get("options")
-                .and_then(|options| options.get("baseURL"))
-                .and_then(Value::as_str),
-            Some("http://127.0.0.1:51805/opencode/openai/v1")
-        );
-    }
-
-    #[test]
-    fn opencode_restore_removes_injected_providers() {
-        let original = r#"{"provider":{"local":{"npm":"@ai-sdk/openai-compatible"}}}"#;
-        let (providers, _) = build_opencode_providers_config(
-            "http://127.0.0.1:51805/opencode",
-            &opencode_test_platform(vec![GrayscaleModelEntry {
-                id: "claude-mythos-preview".into(),
-                provider: "claude".into(),
-                key_id: "gray-claude-key".into(),
-                key_name: "灰度 Claude".into(),
-                source: "grayscale".into(),
-                api: Some("openai-responses".into()),
-                base_path: Some("/openai".into()),
-                context_window: None,
-                max_tokens: None,
-            }]),
-        );
-        let mut value: Value = serde_json::from_str(original).unwrap();
-        merge_opencode_injected_providers(
-            value
-                .as_object_mut()
-                .unwrap()
-                .get_mut("provider")
-                .and_then(Value::as_object_mut)
-                .unwrap(),
-            &providers,
-        );
-        let injected = serde_json::to_string_pretty(&value).unwrap();
-
-        let mut backup = HashMap::new();
-        backup_opencode_providers(&mut backup, "opencode", original);
-        let restored = restore_opencode_providers(&injected, "opencode", &backup).unwrap();
-        let restored_value: Value = serde_json::from_str(&restored).unwrap();
-        let providers = restored_value.get("provider").unwrap().as_object().unwrap();
-        assert!(providers.contains_key("local"));
-        assert!(!providers.contains_key("灰度"));
     }
 
     #[test]
@@ -3898,5 +2451,75 @@ base_url = "http://old.example/codex"
             read_injected_proxy_port(&TOOLS[0], &CODEX_TARGETS[0], content),
             Some(51805)
         );
+    }
+
+    #[test]
+    fn codex_inject_only_updates_openai_base_url() {
+        let injected =
+            inject_codex_openai_proxy_config("", "http://127.0.0.1:51805/codex").unwrap();
+        assert_eq!(
+            injected.trim(),
+            r#"openai_base_url = "http://127.0.0.1:51805/codex""#
+        );
+    }
+
+    #[test]
+    fn codex_inject_migrates_legacy_top_level_base_url() {
+        let original = r#"base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+model = "gpt-5.5"
+
+[model_providers.ai]
+name = "ai"
+base_url = "https://ft-app.wxhand.com/cc"
+wire_api = "responses"
+"#;
+        let mut backup = HashMap::new();
+        backup_codex_provider_toml(&mut backup, "codex", original);
+        let injected =
+            inject_codex_openai_proxy_config(original, "http://127.0.0.1:59301/codex").unwrap();
+        assert!(injected.contains(r#"openai_base_url = "http://127.0.0.1:59301/codex""#));
+        assert!(!injected.contains(r#"base_url = "http://127.0.0.1:15721/v1""#));
+        let (top, _) = split_toml_top_level(&injected);
+        assert!(!top.iter().any(|line| line.trim().starts_with("wire_api =")));
+        assert!(injected.contains(r#"model = "gpt-5.5""#));
+        assert!(injected.contains("[model_providers.ai]"));
+        assert!(injected.contains(r#"base_url = "https://ft-app.wxhand.com/cc""#));
+
+        let restored = restore_codex_provider_toml(&injected, "codex", &backup).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn codex_legacy_top_level_proxy_is_not_treated_as_injected() {
+        let content = r#"base_url = "http://127.0.0.1:15721/v1"
+"#;
+        assert!(!is_zwitch_injected(content));
+        assert_eq!(read_codex_injected_proxy_port(content), None);
+    }
+
+    #[test]
+    fn codex_auth_injection_writes_proxy_managed_key() {
+        let dir = std::env::temp_dir().join(format!("zwitch-codex-auth-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let auth_path = dir.join("auth.json");
+
+        inject_codex_auth(&auth_path).unwrap();
+        assert!(codex_auth_injected(&auth_path));
+
+        let mut backup = crate::store::ConfigBackup::default();
+        fs::write(&auth_path, r#"{"OPENAI_API_KEY":"sk-user-key"}"#).unwrap();
+        backup_codex_auth(&mut backup, &auth_path).unwrap();
+        inject_codex_auth(&auth_path).unwrap();
+        let stored = backup
+            .files
+            .get(&auth_path.to_string_lossy().to_string())
+            .and_then(|entry| entry.get(&backup_key("codex", "auth.json::OPENAI_API_KEY")))
+            .cloned()
+            .unwrap();
+        assert_eq!(stored, "sk-user-key");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

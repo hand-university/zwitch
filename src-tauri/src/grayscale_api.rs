@@ -54,7 +54,7 @@ pub struct GrayscaleModelEntry {
 }
 
 /// 灰度模型注入时的默认 model id。
-pub const GRAYSCALE_DEFAULT_MODEL_ID: &str = "claude-mythos-preview-fast";
+pub const GRAYSCALE_DEFAULT_MODEL_ID: &str = "claude-fable-5";
 
 impl GrayscalePlatformModels {
     pub fn additional_model_ids(&self) -> Vec<String> {
@@ -269,121 +269,6 @@ pub fn find_platform_models<'a>(
         .find(|entry| entry.id == platform)
 }
 
-fn is_builtin_bifrost_provider(provider: &str) -> bool {
-    matches!(
-        provider,
-        "openai" | "anthropic" | "gemini" | "google" | "google-generative-ai"
-    )
-}
-
-/// 判断灰度模型是否应注入 OpenCode（自定义 Provider 或携带 OpenCode 注入元数据）。
-pub fn is_opencode_grayscale_model(model: &GrayscaleModelEntry) -> bool {
-    if model.api.is_some() || model.base_path.is_some() {
-        return true;
-    }
-    let provider = model.provider.trim();
-    !provider.is_empty() && !is_builtin_bifrost_provider(provider)
-}
-
-fn collect_opencode_metadata_models(
-    response: &GrayscaleModelsResponse,
-) -> Vec<GrayscaleModelEntry> {
-    let mut seen = HashSet::new();
-    let mut models = Vec::new();
-    for platform in &response.platforms {
-        for model in &platform.additional_models {
-            if !is_opencode_grayscale_model(model) {
-                continue;
-            }
-            if seen.insert(model.id.clone()) {
-                models.push(model.clone());
-            }
-        }
-    }
-    models
-}
-
-fn synthesize_opencode_platform(
-    response: &GrayscaleModelsResponse,
-    additional_models: Vec<GrayscaleModelEntry>,
-    base_path: String,
-) -> GrayscalePlatformModels {
-    GrayscalePlatformModels {
-        id: "opencode".into(),
-        label: "OpenCode".into(),
-        base_path,
-        injection_mode: response.injection_mode.clone(),
-        models: vec![],
-        additional_models,
-    }
-}
-
-/// 解析 OpenCode 应注入的灰度模型平台数据。
-///
-/// 优先使用 `platform=opencode`；若后端将自定义 OpenAI 兼容 Provider 挂在 codex 平台，
-/// 则回退收集非内置 Provider 的灰度模型。
-pub fn resolve_opencode_grayscale_platform(
-    response: &GrayscaleModelsResponse,
-) -> Option<GrayscalePlatformModels> {
-    if let Some(platform) = find_platform_models(response, "opencode") {
-        if !platform.additional_models.is_empty() {
-            return Some(platform.clone());
-        }
-    }
-
-    for platform_id in ["codex"] {
-        let Some(platform) = find_platform_models(response, platform_id) else {
-            continue;
-        };
-        let custom_models: Vec<_> = platform
-            .additional_models
-            .iter()
-            .filter(|model| is_opencode_grayscale_model(model))
-            .cloned()
-            .collect();
-        if !custom_models.is_empty() {
-            return Some(synthesize_opencode_platform(
-                response,
-                custom_models,
-                platform.base_path.clone(),
-            ));
-        }
-    }
-
-    let metadata_models = collect_opencode_metadata_models(response);
-    if metadata_models.is_empty() {
-        return None;
-    }
-
-    let base_path = metadata_models
-        .iter()
-        .find_map(|model| model.base_path.clone())
-        .or_else(|| {
-            find_platform_models(response, "opencode").map(|platform| platform.base_path.clone())
-        })
-        .unwrap_or_else(|| "/openai".to_string());
-
-    Some(synthesize_opencode_platform(
-        response,
-        metadata_models,
-        base_path,
-    ))
-}
-
-pub fn merge_opencode_platform_response(
-    mut response: GrayscaleModelsResponse,
-    opencode_only: GrayscaleModelsResponse,
-) -> GrayscaleModelsResponse {
-    let Some(opencode_platform) = find_platform_models(&opencode_only, "opencode") else {
-        return response;
-    };
-    response
-        .platforms
-        .retain(|platform| platform.id != "opencode");
-    response.platforms.push(opencode_platform.clone());
-    response
-}
-
 #[cfg(test)]
 fn test_grayscale_model(id: &str, provider: &str) -> GrayscaleModelEntry {
     GrayscaleModelEntry {
@@ -406,21 +291,21 @@ mod tests {
     #[test]
     fn prioritize_grayscale_default_model_moves_preferred_id_first() {
         let models = vec![
-            test_grayscale_model("claude-mythos-preview", "anthropic"),
-            test_grayscale_model("claude-mythos-preview-fast", "anthropic"),
+            test_grayscale_model("claude-sonnet-4-5", "anthropic"),
+            test_grayscale_model("claude-fable-5", "anthropic"),
         ];
         let ordered = prioritize_grayscale_default_model(&models);
         assert_eq!(
             ordered.iter().map(|model| model.id.as_str()).collect::<Vec<_>>(),
-            vec!["claude-mythos-preview-fast", "claude-mythos-preview"]
+            vec!["claude-fable-5", "claude-sonnet-4-5"]
         );
     }
 
     #[test]
     fn grayscale_model_display_name_title_cases_dash_segments() {
         assert_eq!(
-            grayscale_model_display_name("claude-mythos-preview"),
-            "Claude Mythos Preview"
+            grayscale_model_display_name("claude-fable-5"),
+            "Claude Fable 5"
         );
         assert_eq!(
             grayscale_model_display_name("claude-sonnet-4-5"),
@@ -432,13 +317,13 @@ mod tests {
     #[test]
     fn anthropic_models_list_uses_title_cased_display_name() {
         let response = anthropic_models_list_response(&[test_grayscale_model(
-            "claude-mythos-preview",
+            "claude-fable-5",
             "anthropic",
         )]);
         let parsed: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(
             parsed["data"][0]["display_name"].as_str(),
-            Some("Claude Mythos Preview")
+            Some("Claude Fable 5")
         );
     }
 
@@ -476,7 +361,7 @@ mod tests {
                     {"id": "claude-opus-4", "source": "builtin"}
                 ],
                 "additional_models": [
-                    {"id": "claude-mythos-preview", "source": "grayscale"}
+                    {"id": "claude-fable-5", "source": "grayscale"}
                 ]
             }]
         }"#;
@@ -484,110 +369,8 @@ mod tests {
         let platform = find_platform_models(&parsed, "claude").unwrap();
         assert_eq!(
             platform.additional_model_ids(),
-            vec!["claude-mythos-preview"]
+            vec!["claude-fable-5"]
         );
         assert_eq!(platform.models.len(), 1);
-    }
-
-    #[test]
-    fn resolve_opencode_platform_from_codex_custom_provider() {
-        let response: GrayscaleModelsResponse = serde_json::from_str(
-            r#"{
-            "injection_mode": "append",
-            "platforms": [{
-                "id": "codex",
-                "base_path": "/openai",
-                "additional_models": [{
-                    "id": "claude-mythos-preview",
-                    "provider": "claude",
-                    "source": "grayscale"
-                }]
-            }]
-        }"#,
-        )
-        .unwrap();
-
-        let platform = resolve_opencode_grayscale_platform(&response).unwrap();
-        assert_eq!(platform.id, "opencode");
-        assert_eq!(platform.base_path, "/openai");
-        assert_eq!(platform.additional_models.len(), 1);
-        assert_eq!(platform.additional_models[0].provider, "claude");
-    }
-
-    #[test]
-    fn resolve_opencode_prefers_dedicated_platform() {
-        let response: GrayscaleModelsResponse = serde_json::from_str(
-            r#"{
-            "platforms": [
-                {
-                    "id": "codex",
-                    "base_path": "/openai",
-                    "additional_models": [{
-                        "id": "from-codex",
-                        "provider": "claude",
-                        "source": "grayscale"
-                    }]
-                },
-                {
-                    "id": "opencode",
-                    "base_path": "/openai",
-                    "additional_models": [{
-                        "id": "from-opencode",
-                        "provider": "claude",
-                        "source": "grayscale"
-                    }]
-                }
-            ]
-        }"#,
-        )
-        .unwrap();
-
-        let platform = resolve_opencode_grayscale_platform(&response).unwrap();
-        assert_eq!(platform.additional_models[0].id, "from-opencode");
-    }
-
-    #[test]
-    fn parses_opencode_model_context_metadata() {
-        let raw = r#"{
-            "platforms": [{
-                "id": "opencode",
-                "additional_models": [{
-                    "id": "claude-mythos-preview",
-                    "provider": "claude",
-                    "context_window": 200000,
-                    "max_tokens": 32000,
-                    "source": "grayscale"
-                }]
-            }]
-        }"#;
-        let parsed: GrayscaleModelsResponse = serde_json::from_str(raw).unwrap();
-        let model = &find_platform_models(&parsed, "opencode")
-            .unwrap()
-            .additional_models[0];
-        assert_eq!(model.context_window, Some(200_000));
-        assert_eq!(model.max_tokens, Some(32_000));
-    }
-
-    #[test]
-    fn parses_opencode_custom_provider_metadata() {
-        let raw = r#"{
-            "platforms": [{
-                "id": "opencode",
-                "base_path": "/openai",
-                "additional_models": [{
-                    "id": "claude-mythos-preview",
-                    "provider": "claude",
-                    "api": "openai-responses",
-                    "base_path": "/openai",
-                    "source": "grayscale"
-                }]
-            }]
-        }"#;
-        let parsed: GrayscaleModelsResponse = serde_json::from_str(raw).unwrap();
-        let platform = find_platform_models(&parsed, "opencode").unwrap();
-        let model = &platform.additional_models[0];
-        assert_eq!(model.provider, "claude");
-        assert_eq!(model.api.as_deref(), Some("openai-responses"));
-        assert_eq!(model.base_path.as_deref(), Some("/openai"));
     }
 }
