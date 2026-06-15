@@ -515,7 +515,11 @@ async fn forward_request(
         model: usage::extract_model(provider, path, body_bytes),
     });
 
-    build_upstream_response(upstream_resp, usage_ctx)
+    // OpenCode 走自定义 OpenAI 兼容路由，上游对灰度模型不回报 output_tokens；
+    // 代理在转发时按响应文本估算补写，避免 OpenCode 上下文面板显示 0。
+    let rewrite_usage = tool_id == "opencode";
+
+    build_upstream_response(upstream_resp, usage_ctx, rewrite_usage)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
@@ -575,6 +579,7 @@ fn is_streaming_content_type(content_type: Option<&str>) -> bool {
 async fn build_upstream_response(
     upstream_resp: reqwest::Response,
     usage_ctx: Option<UsageContext>,
+    rewrite_usage: bool,
 ) -> Result<Response, String> {
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
@@ -592,8 +597,15 @@ async fn build_upstream_response(
 
     // 仅在成功响应时统计用量；失败响应没有有效 usage。
     let usage_ctx = usage_ctx.filter(|_| status.is_success());
+    let rewrite_usage = rewrite_usage && status.is_success();
 
     if is_streaming_content_type(content_type) {
+        if rewrite_usage {
+            let stream = rewrite_streaming_usage(upstream_resp.bytes_stream());
+            return response
+                .body(Body::from_stream(stream))
+                .map_err(|_| "构建流式响应失败".to_string());
+        }
         let stream = tap_streaming(upstream_resp.bytes_stream(), usage_ctx);
         return response
             .body(Body::from_stream(stream))
@@ -605,6 +617,13 @@ async fn build_upstream_response(
         .await
         .map_err(|e| format!("读取上游响应失败: {e}"))?;
 
+    if rewrite_usage {
+        let rewritten = usage::rewrite_non_streaming_output_usage(&bytes);
+        return response
+            .body(Body::from(rewritten))
+            .map_err(|_| "构建响应失败".to_string());
+    }
+
     if let Some(ctx) = usage_ctx {
         ctx.record_non_streaming(&bytes);
     }
@@ -612,6 +631,53 @@ async fn build_upstream_response(
     response
         .body(Body::from(bytes))
         .map_err(|_| "构建响应失败".to_string())
+}
+
+/// 流式改写：透传上游分片，仅在终止用量事件上为 OpenCode 补写估算的 output_tokens。
+fn rewrite_streaming_usage<S>(
+    inner: S,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>>>
+where
+    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+{
+    struct RewriteState<S> {
+        inner: S,
+        rewriter: usage::OpencodeUsageRewriter,
+        ended: bool,
+    }
+
+    let init = RewriteState {
+        inner,
+        rewriter: usage::OpencodeUsageRewriter::new(),
+        ended: false,
+    };
+
+    futures_util::stream::unfold(init, |mut state| async move {
+        if state.ended {
+            return None;
+        }
+        match state.inner.next().await {
+            Some(Ok(chunk)) => {
+                let out = state.rewriter.push(&chunk);
+                let item: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                    Ok(bytes::Bytes::from(out));
+                Some((item, state))
+            }
+            Some(Err(e)) => {
+                state.ended = true;
+                let item: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                    Err(Box::new(e));
+                Some((item, state))
+            }
+            None => {
+                let tail = state.rewriter.finish();
+                state.ended = true;
+                let item: Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> =
+                    Ok(bytes::Bytes::from(tail));
+                Some((item, state))
+            }
+        }
+    })
 }
 
 /// 旁路累积流式分片：原样透传给 CLI，待流结束时解析用量。

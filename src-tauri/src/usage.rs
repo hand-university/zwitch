@@ -444,6 +444,227 @@ fn parse_gemini_usage(value: &serde_json::Value) -> Option<TokenUsage> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// OpenCode 用量兜底：上游 OpenAI 兼容路由对灰度模型只回报 input_tokens，
+// output/cache 恒为 0，导致 OpenCode 的「Context」面板显示 0 tokens / 0% / $0。
+// 代理在转发给 OpenCode 时，按响应文本估算 output_tokens 并补写进 `usage`，
+// 仅在上游缺失（output == 0）时介入，绝不覆盖上游已返回的真实值。
+// ---------------------------------------------------------------------------
+
+/// 按文本估算输出 token 数：ASCII 约 4 字符/token，其余（CJK 等）按 1 token/字（偏保守上界）。
+pub fn estimate_output_tokens(text: &str) -> u64 {
+    let mut ascii = 0u64;
+    let mut wide = 0u64;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    ascii.div_ceil(4) + wide
+}
+
+/// 从单个流式事件里提取增量输出文本（Responses API 的 `response.output_text.delta`
+/// 或 Chat Completions 的 `choices[].delta.content`）。仅取可见输出，不含推理摘要。
+fn extract_event_output_text(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(|v| v.as_str()) == Some("response.output_text.delta") {
+        if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+            return Some(delta.to_string());
+        }
+    }
+    if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+        let mut acc = String::new();
+        for choice in choices {
+            if let Some(content) = choice
+                .get("delta")
+                .and_then(|d| d.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                acc.push_str(content);
+            }
+        }
+        if !acc.is_empty() {
+            return Some(acc);
+        }
+    }
+    None
+}
+
+/// 从非流式响应体里提取完整输出文本（Responses API 的 `output[].content[].text`
+/// 或 Chat Completions 的 `choices[].message.content`）。
+fn extract_full_output_text(value: &serde_json::Value) -> String {
+    let mut acc = String::new();
+    if let Some(output) = value.get("output").and_then(|v| v.as_array()) {
+        for item in output {
+            if let Some(content) = item.get("content").and_then(|v| v.as_array()) {
+                for part in content {
+                    if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                        acc.push_str(text);
+                    }
+                }
+            }
+        }
+    }
+    if acc.is_empty() {
+        if let Some(choices) = value.get("choices").and_then(|v| v.as_array()) {
+            for choice in choices {
+                if let Some(text) = choice
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    acc.push_str(text);
+                }
+            }
+        }
+    }
+    acc
+}
+
+/// 是否为携带最终用量的终止事件：Chat Completions 末尾分片（顶层 `usage`）或
+/// Responses API 的 `response.completed`。中间事件（如 `response.in_progress`）不改写。
+fn is_terminal_usage_event(value: &serde_json::Value) -> bool {
+    if value.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+        return true;
+    }
+    value.get("type").and_then(|v| v.as_str()) == Some("response.completed")
+}
+
+/// 取出可改写的 usage 对象：顶层 `usage` 或 `response.usage`。
+fn usage_map_mut(value: &mut serde_json::Value) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    if value.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+        return value.get_mut("usage").and_then(|u| u.as_object_mut());
+    }
+    if let Some(response) = value.get_mut("response") {
+        if response.get("usage").map(|u| u.is_object()).unwrap_or(false) {
+            return response.get_mut("usage").and_then(|u| u.as_object_mut());
+        }
+    }
+    None
+}
+
+/// 若 usage 的输出 token 缺失或为 0，则写入估算值并同步 `total_tokens`。
+/// 返回是否发生改写（上游已有非零输出时不改写）。
+fn rewrite_event_usage(value: &mut serde_json::Value, output_estimate: u64) -> bool {
+    if output_estimate == 0 {
+        return false;
+    }
+    let Some(usage) = usage_map_mut(value) else {
+        return false;
+    };
+    let out_key = if usage.contains_key("completion_tokens") && !usage.contains_key("output_tokens") {
+        "completion_tokens"
+    } else {
+        "output_tokens"
+    };
+    let current = usage.get(out_key).and_then(|v| v.as_u64()).unwrap_or(0);
+    if current > 0 {
+        return false;
+    }
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| usage.get("prompt_tokens").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+    let reasoning = usage
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    usage.insert(out_key.to_string(), serde_json::Value::from(output_estimate));
+    usage.insert(
+        "total_tokens".to_string(),
+        serde_json::Value::from(input + output_estimate + reasoning),
+    );
+    true
+}
+
+/// 改写非流式 OpenCode 响应：按完整输出文本估算 output_tokens 并补写 usage。
+pub fn rewrite_non_streaming_output_usage(body: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.to_vec();
+    };
+    let estimate = estimate_output_tokens(&extract_full_output_text(&value));
+    if rewrite_event_usage(&mut value, estimate) {
+        serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+    } else {
+        body.to_vec()
+    }
+}
+
+/// 流式 SSE 改写器：原样透传各分片（保留流式体验），仅在终止用量事件上
+/// 补写估算的 output_tokens。处理跨分片拆行，逐行解析 `data:` 负载。
+#[derive(Default)]
+pub struct OpencodeUsageRewriter {
+    line_buf: Vec<u8>,
+    output_text: String,
+}
+
+impl OpencodeUsageRewriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一段上游分片，返回应转发给 OpenCode 的字节（可能与输入相同）。
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.line_buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = self.line_buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            out.extend_from_slice(&self.process_line(&line));
+        }
+        out
+    }
+
+    /// 流结束时冲洗剩余未带换行的尾行。
+    pub fn finish(&mut self) -> Vec<u8> {
+        if self.line_buf.is_empty() {
+            return Vec::new();
+        }
+        let line = std::mem::take(&mut self.line_buf);
+        self.process_line(&line)
+    }
+
+    fn process_line(&mut self, line: &[u8]) -> Vec<u8> {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return line.to_vec();
+        };
+        let trimmed = text.trim_end_matches('\n').trim_end_matches('\r');
+        let Some(payload) = trimmed.strip_prefix("data:").map(|rest| rest.trim()) else {
+            return line.to_vec();
+        };
+        if payload.is_empty() || payload == "[DONE]" {
+            return line.to_vec();
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return line.to_vec();
+        };
+
+        if let Some(delta) = extract_event_output_text(&value) {
+            self.output_text.push_str(&delta);
+        }
+
+        if is_terminal_usage_event(&value) {
+            let estimate = estimate_output_tokens(&self.output_text);
+            if rewrite_event_usage(&mut value, estimate) {
+                if let Ok(new_payload) = serde_json::to_string(&value) {
+                    let ending = if text.ends_with("\r\n") {
+                        "\r\n"
+                    } else if text.ends_with('\n') {
+                        "\n"
+                    } else {
+                        ""
+                    };
+                    return format!("data: {new_payload}{ending}").into_bytes();
+                }
+            }
+        }
+
+        line.to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +801,122 @@ mod tests {
             "data: {\"type\":\"message_stop\"}\n\n",
         );
         assert!(is_successful_response(Provider::Anthropic, body.as_bytes(), true));
+    }
+
+    #[test]
+    fn estimate_output_tokens_blends_ascii_and_wide() {
+        assert_eq!(estimate_output_tokens(""), 0);
+        assert_eq!(estimate_output_tokens("abcd"), 1); // 4 ascii -> 1
+        assert_eq!(estimate_output_tokens("abcde"), 2); // ceil(5/4)
+        assert_eq!(estimate_output_tokens("你好"), 2); // 2 wide chars -> 2
+    }
+
+    fn run_rewriter(chunks: &[&str]) -> String {
+        let mut rw = OpencodeUsageRewriter::new();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(&rw.push(chunk.as_bytes()));
+        }
+        out.extend_from_slice(&rw.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    fn usage_from_completed_stream(output: &str) -> serde_json::Value {
+        for line in output.lines() {
+            let Some(payload) = line.strip_prefix("data:").map(|r| r.trim()) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+                continue;
+            };
+            if let Some(usage) = value
+                .get("usage")
+                .or_else(|| value.get("response").and_then(|r| r.get("usage")))
+            {
+                return usage.clone();
+            }
+        }
+        panic!("no usage event found in:\n{output}");
+    }
+
+    #[test]
+    fn rewriter_injects_output_for_responses_api() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello \"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":0,\"total_tokens\":1200}}}\n\n",
+        );
+        let out = run_rewriter(&[body]);
+        let usage = usage_from_completed_stream(&out);
+        assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(3)); // "hello world" -> ceil(11/4)=3
+        assert_eq!(usage.get("input_tokens").and_then(|v| v.as_u64()), Some(1200));
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(1203));
+        // 增量分片原样透传
+        assert!(out.contains("\"delta\":\"hello \""));
+    }
+
+    #[test]
+    fn rewriter_injects_output_for_chat_completions() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"abcd\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"efgh\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":0,\"total_tokens\":50}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let out = run_rewriter(&[body]);
+        let usage = usage_from_completed_stream(&out);
+        assert_eq!(usage.get("completion_tokens").and_then(|v| v.as_u64()), Some(2)); // 8 ascii -> 2
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(52));
+        assert!(out.contains("[DONE]"));
+    }
+
+    #[test]
+    fn rewriter_handles_split_chunks_identically() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello world\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        );
+        let mid = body.len() / 2;
+        let split = run_rewriter(&[&body[..mid], &body[mid..]]);
+        let usage = usage_from_completed_stream(&split);
+        assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn rewriter_does_not_clobber_real_output() {
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":99,\"total_tokens\":109}}}\n\n",
+        );
+        let out = run_rewriter(&[body]);
+        let usage = usage_from_completed_stream(&out);
+        assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(99));
+        assert_eq!(usage.get("total_tokens").and_then(|v| v.as_u64()), Some(109));
+    }
+
+    #[test]
+    fn rewriter_passthrough_when_no_output_text() {
+        let body = "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n";
+        let out = run_rewriter(&[body]);
+        let usage = usage_from_completed_stream(&out);
+        assert_eq!(usage.get("output_tokens").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn non_streaming_rewrite_responses_api() {
+        let body = br#"{"output":[{"content":[{"type":"output_text","text":"hello world"}]}],"usage":{"input_tokens":1200,"output_tokens":0,"total_tokens":1200}}"#;
+        let out = rewrite_non_streaming_output_usage(body);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["usage"]["output_tokens"].as_u64(), Some(3));
+        assert_eq!(value["usage"]["total_tokens"].as_u64(), Some(1203));
+    }
+
+    #[test]
+    fn non_streaming_rewrite_skips_error_body() {
+        let body = br#"{"is_bifrost_error":true,"status_code":504,"error":{"message":"timeout"}}"#;
+        let out = rewrite_non_streaming_output_usage(body);
+        assert_eq!(out, body);
     }
 }
